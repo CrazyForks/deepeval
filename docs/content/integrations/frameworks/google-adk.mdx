@@ -1,0 +1,195 @@
+---
+id: google-adk
+title: Google ADK
+sidebar_label: Google ADK
+---
+[Google's Agent Development Kit (ADK)](https://adk.dev/) is an open-source framework for building, orchestrating, and tracing generative-AI agents.
+
+:::tip
+We recommend logging in to [Confident AI](https://app.confident-ai.com) to view your Google ADK evaluations.
+
+```bash
+deepeval login
+```
+
+For users in the EU region, please set your OTEL endpoint in the env as following:
+
+```bash
+export CONFIDENT_OTEL_URL="https://eu.otel.confident-ai.com"
+
+```
+
+Or if you're in the AU region, please set your OTEL endpoint in the env as following:
+
+```bash
+export CONFIDENT_OTEL_URL="https://au.otel.confident-ai.com"
+
+```
+
+:::
+
+`deepeval` instruments Google ADK through the community-maintained [`openinference-instrumentation-google-adk`](https://github.com/Arize-ai/openinference/tree/main/python/instrumentation/openinference-instrumentation-google-adk) package. Every ADK agent, model call, and tool invocation emits an OTel span tagged with OpenInference semantic conventions, which `deepeval` then translates into Confident AI traces.
+
+```bash
+pip install google-adk openinference-instrumentation-google-adk
+```
+
+## End-to-End Evals
+
+`deepeval` allows you to evaluate Google ADK agents in **under a minute**.
+
+<Steps>
+
+<Step>
+### Configure Google ADK
+
+
+Pass `agent_metrics` to the `instrument_google_adk` method.
+
+```python title="main.py" showLineNumbers
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+from deepeval.integrations.google_adk import instrument_google_adk
+from deepeval.metrics import AnswerRelevancyMetric
+
+instrument_google_adk(
+    name="Google ADK Tracing",
+    environment="development",
+    agent_metrics=[AnswerRelevancyMetric()],
+)
+
+def get_weather(city: str) -> dict:
+    return {"city": city, "forecast": "sunny, 24C"}
+
+weather_agent = Agent(
+    name="weather_agent",
+    model="gemini-2.0-flash",
+    instruction="Use the get_weather tool to answer questions about the weather.",
+    tools=[get_weather],
+)
+
+APP_NAME = "weather_app"
+USER_ID = "demo-user"
+SESSION_ID = "demo-session"
+
+session_service = InMemorySessionService()
+session_service.create_session(
+    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
+)
+runner = Runner(
+    agent=weather_agent, app_name=APP_NAME, session_service=session_service
+)
+
+def invoke(prompt: str) -> str:
+    user_msg = types.Content(role="user", parts=[types.Part(text=prompt)])
+    final = ""
+    for event in runner.run(
+        user_id=USER_ID, session_id=SESSION_ID, new_message=user_msg
+    ):
+        if event.is_final_response():
+            final = event.content.parts[0].text
+    return final
+
+invoke("What's the weather in Paris?")
+```
+
+:::info
+Evaluations are supported for Google ADK `Agent`. Only metrics with parameters `input`, `output` and `tools_called` are eligible for evaluation.
+:::
+
+</Step>
+<Step>
+### Run evaluations
+
+
+Create an `EvaluationDataset` and invoke your Google ADK agent for each golden within the `evals_iterator()` loop to run end-to-end evaluations.
+
+<Tabs items={["Synchronous"]}>
+<Tab value="Synchronous">
+
+```python title="main.py" showLineNumbers
+from deepeval.dataset import EvaluationDataset, Golden
+from deepeval.evaluate.configs import AsyncConfig
+
+dataset = EvaluationDataset(
+    goldens=[
+        Golden(input="What's the weather in Paris?"),
+        Golden(input="What's the weather in London?"),
+    ]
+)
+
+for golden in dataset.evals_iterator(async_config=AsyncConfig(run_async=False)):
+    invoke(golden.input)
+```
+
+</Tab>
+</Tabs>
+
+✅ Done. The `evals_iterator` will automatically generate a test run with individual evaluation traces for each golden.
+
+</Step>
+
+</Steps>
+
+## Evals in Production
+
+To run online evaluations in production, replace `agent_metrics` with a [metric collection](https://www.confident-ai.com/docs/metrics/metric-collections) string from Confident AI, and run your Google ADK agent as usual:
+
+```python filename="main.py" showLineNumbers
+from google.adk.agents import Agent
+from deepeval.integrations.google_adk import instrument_google_adk
+
+instrument_google_adk(
+    name="Google ADK Tracing",
+    environment="production",
+    trace_metric_collection="my-trace-collection",
+    agent_metric_collection="my-agent-collection",
+    llm_metric_collection="my-llm-collection",
+    tool_metric_collection_map={
+        "get_weather": "my-tool-collection",
+    },
+)
+
+weather_agent = Agent(
+    name="weather_agent",
+    model="gemini-2.0-flash",
+    instruction="Use the get_weather tool to answer questions about the weather.",
+    tools=[get_weather],
+)
+```
+
+`deepeval` allows you to run component evals at different levels like Trace, Agent, LLM and Tool spans. You can pass your metric collection for any spans using the `instrument_google_adk` method.
+
+## Combining with `@observe`
+
+`instrument_google_adk` is OTel-based, but it composes cleanly with deepeval's native `@observe` decorator. When an ADK call runs inside an `@observe`'d function, both the deepeval-native span (your Python function) and the OTel spans (ADK's agent, LLM, and tool invocations) land on the same trace.
+
+```python title="main.py" showLineNumbers
+from deepeval.tracing import observe
+from deepeval.metrics import AnswerRelevancyMetric
+from deepeval.integrations.google_adk import instrument_google_adk
+
+instrument_google_adk(name="Google ADK Tracing", environment="development")
+
+@observe(type="agent", metrics=[AnswerRelevancyMetric()])
+def my_pipeline(query: str) -> str:
+    # ADK runs here -> OTel spans, attached to the SAME trace
+    return invoke(query)
+```
+
+## Using `deepeval.instrument(...)` directly
+
+If you'd rather wire up `GoogleADKInstrumentor` yourself (for example, alongside other OpenInference instrumentors), use `deepeval.instrument(...)` to set up the OTel backend once and call any OpenInference instrumentor on top of it:
+
+```python title="main.py" showLineNumbers
+import deepeval
+from openinference.instrumentation.google_adk import GoogleADKInstrumentor
+
+deepeval.instrument(name="my-adk-app", environment="development")
+GoogleADKInstrumentor().instrument()
+```
+
+This is the same pattern you'd use for any other OpenInference-instrumented framework.
