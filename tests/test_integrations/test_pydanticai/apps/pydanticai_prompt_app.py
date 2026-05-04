@@ -37,7 +37,6 @@ def create_prompt_agent(
         thread_id=thread_id,
         user_id=user_id,
         confident_prompt=prompt,
-        is_test_mode=True,
     )
 
     return Agent(

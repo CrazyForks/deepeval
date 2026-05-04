@@ -23,7 +23,6 @@ def create_streaming_agent(
         metadata=metadata or {"test_type": "streaming"},
         thread_id=thread_id,
         user_id=user_id,
-        is_test_mode=True,
     )
 
     return Agent(

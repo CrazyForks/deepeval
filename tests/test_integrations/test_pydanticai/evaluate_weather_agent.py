@@ -28,7 +28,7 @@ weather_agent = Agent(
     deps_type=Deps,
     retries=2,
     instrument=ConfidentInstrumentationSettings(
-        is_test_mode=True, agent_metrics=[AnswerRelevancyMetric()]
+        agent_metrics=[AnswerRelevancyMetric()]
     ),
 )
 

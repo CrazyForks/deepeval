@@ -13,6 +13,7 @@ import json
 from deepeval.prompt.prompt import Prompt
 from deepeval.telemetry import capture_tracing_integration
 from deepeval.tracing import trace_manager
+from deepeval.tracing.context import current_trace_context
 from deepeval.tracing.types import (
     Trace,
     TraceSpanStatus,
@@ -41,7 +42,7 @@ from deepeval.tracing import perf_epoch_bridge as peb
 from deepeval.tracing.types import TraceAttributes
 from deepeval.test_case import ToolCall
 from dataclasses import dataclass
-import deepeval
+from deepeval.confident.api import set_confident_api_key
 from deepeval.tracing.utils import make_json_serializable_for_metadata
 
 
@@ -74,8 +75,12 @@ class ConfidentSpanExporter(SpanExporter):
         capture_tracing_integration("otel.ConfidentSpanExporter")
         peb.init_clock_bridge()
 
+        # Programmatic auth — set the key in settings without printing the
+        # interactive `deepeval login` banner. The banner is reserved for the
+        # CLI command; auto-firing it from inside an exporter constructor is
+        # noise (especially when CONFIDENT_API_KEY is already in env).
         if api_key:
-            deepeval.login(api_key)
+            set_confident_api_key(api_key)
 
         super().__init__()
 
@@ -93,6 +98,23 @@ class ConfidentSpanExporter(SpanExporter):
         _test_run_id: Optional[str] = None,
     ) -> SpanExportResult:
 
+        ################ Detect active deepeval trace context ################
+        # If we're inside an active ``@observe`` / ``with trace(...)`` block,
+        # the OTel spans should be merged into the existing trace_manager
+        # trace (instead of spawning a new one keyed by the OTel-derived
+        # trace_uuid) and the lifecycle is owned by the wrapping context —
+        # the exporter must NOT call ``end_trace`` / ``clear_traces`` because:
+        #   1. SimpleSpanProcessor (REST leg of ContextAwareSpanProcessor)
+        #      calls export() once per OTel span, so end_trace per call would
+        #      post the same trace N times.
+        #   2. ``@observe`` already calls end_trace exactly once when the
+        #      wrapped function returns.
+        active_trace_ctx = current_trace_context.get()
+        in_active_context = isinstance(active_trace_ctx, Trace)
+        target_trace_uuid: Optional[str] = (
+            active_trace_ctx.uuid if in_active_context else None
+        )
+
         ################ Build Forest of Spans ################
         forest = self._build_span_forest(spans)
 
@@ -105,6 +127,14 @@ class ConfidentSpanExporter(SpanExporter):
                 base_span_wrapper = self._convert_readable_span_to_base_span(
                     span
                 )
+
+                # Re-key OTel spans onto the active deepeval trace so they
+                # land in the existing trace_manager entry rather than
+                # creating a phantom duplicate keyed by the OTel trace_id.
+                if target_trace_uuid:
+                    base_span_wrapper.base_span.trace_uuid = (
+                        target_trace_uuid
+                    )
 
                 spans_wrappers_list.append(base_span_wrapper)
             spans_wrappers_forest.append(spans_wrappers_list)
@@ -134,6 +164,31 @@ class ConfidentSpanExporter(SpanExporter):
                 # no removing span because it can be parent of other spans
                 trace_manager.add_span(base_span_wrapper.base_span)
                 trace_manager.add_span_to_trace(base_span_wrapper.base_span)
+
+        # When inside an active deepeval trace context, the wrapping
+        # ``@observe`` / ``with trace(...)`` owns the trace lifecycle. Just
+        # contribute spans and bow out — no end_trace, no clear_traces, no
+        # post. Calling end_trace here would (a) post duplicates (one per
+        # OTel span flush) and (b) race against worker shutdown when the
+        # interpreter tears down, surfacing as
+        # ``cannot schedule new futures after shutdown``.
+        #
+        # We DO need to drop our OTel spans from ``trace_manager.active_spans``
+        # though: they've already ended on the OTel side (the SDK only calls
+        # ``export(...)`` after ``on_end``), so leaving them in the in-flight
+        # registry would block the wrapping ``@observe`` block from ending the
+        # trace — its end_trace check `not other_active_spans` would always
+        # see our OTel spans as still active and silently skip the post.
+        # The OTLP path (no active context) doesn't need this because the
+        # ``end_trace + clear_traces`` branch below wipes ``active_spans`` as
+        # a side effect.
+        if in_active_context:
+            for spans_wrappers_list in spans_wrappers_forest:
+                for base_span_wrapper in spans_wrappers_list:
+                    trace_manager.remove_span(
+                        base_span_wrapper.base_span.uuid
+                    )
+            return SpanExportResult.SUCCESS
 
         # safely end all active traces or return them for test runs
         active_traces_keys = list(trace_manager.active_traces.keys())

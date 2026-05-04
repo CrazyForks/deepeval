@@ -41,7 +41,6 @@ def create_evals_agent(
         trace_metric_collection=trace_metric_collection,
         confident_prompt=confident_prompt,
         agent_metrics=agent_metrics,
-        is_test_mode=True,
     )
 
     agent = Agent(

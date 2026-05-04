@@ -25,7 +25,6 @@ def create_trace_metric_collection_agent(
         thread_id=thread_id,
         user_id=user_id,
         trace_metric_collection=metric_collection,
-        is_test_mode=True,
     )
 
     return Agent(
@@ -52,7 +51,6 @@ def create_agent_metric_collection_agent(
         thread_id=thread_id,
         user_id=user_id,
         agent_metric_collection=metric_collection,
-        is_test_mode=True,
     )
 
     return Agent(
@@ -79,7 +77,6 @@ def create_llm_metric_collection_agent(
         thread_id=thread_id,
         user_id=user_id,
         llm_metric_collection=metric_collection,
-        is_test_mode=True,
     )
 
     return Agent(

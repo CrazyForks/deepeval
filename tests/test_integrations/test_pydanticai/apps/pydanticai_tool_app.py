@@ -25,7 +25,6 @@ def create_tool_agent(
         thread_id=thread_id,
         user_id=user_id,
         tool_metric_collection_map=tool_metric_collection_map or {},
-        is_test_mode=True,
     )
 
     agent = Agent(
