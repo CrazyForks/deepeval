@@ -844,6 +844,35 @@ class TestNextSpanPureContextAPI:
         with next_agent_span(metric_collection="fresh"):
             assert pop_pending_for("agent") == {"metric_collection": "fresh"}
 
+    def test_drain_visible_across_asyncio_sub_context(self):
+        """Regression: ``Agent.run_sync(...)`` calls ``asyncio.run(...)``
+        which creates a new asyncio context that inherits a SNAPSHOT of
+        contextvars. A naive ``ContextVar.set(None)`` from inside that
+        snapshot would not propagate back, letting a second consumer in
+        the parent context re-consume the same value.
+
+        This test simulates the failure mode by running the consumer
+        inside ``asyncio.run`` and verifying that the second consumer
+        in the OUTER context sees the slot already drained.
+        """
+        import asyncio
+
+        with next_agent_span(metric_collection="only-once"):
+
+            async def _consume():
+                return pop_pending_for("agent")
+
+            # First consumer runs inside asyncio.run — same trick
+            # ``Agent.run_sync`` plays internally.
+            first = asyncio.run(_consume())
+            assert first == {"metric_collection": "only-once"}
+
+            # Second consumer in the outer ``with`` context. Must see
+            # an empty dict because the asyncio sub-context's drain
+            # mutated the shared ``_PendingSlot``.
+            second = pop_pending_for("agent")
+            assert second == {}
+
     def test_other_typed_helpers_each_use_their_own_slot(self):
         """Smoke test that ``next_tool_span`` / ``next_retriever_span``
         wire up to their respective slots (not the base/agent/llm

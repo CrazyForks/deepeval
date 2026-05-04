@@ -12,6 +12,7 @@ from deepeval.tracing.types import (
 )
 from deepeval.test_case.llm_test_case import ToolCall, LLMTestCase
 from deepeval.prompt.prompt import Prompt
+from deepeval.metrics import BaseMetric
 
 
 class SpanContext:
@@ -72,6 +73,7 @@ def update_current_span(
     name: Optional[str] = None,
     test_case: Optional[LLMTestCase] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ):
     current_span = current_span_context.get()
     if not current_span:
@@ -105,6 +107,8 @@ def update_current_span(
         current_span.name = name
     if metric_collection:
         current_span.metric_collection = metric_collection
+    if metrics:
+        current_span.metrics = metrics
 
 
 def update_current_trace(
@@ -125,6 +129,7 @@ def update_current_trace(
     test_case_id: Optional[str] = None,
     turn_id: Optional[str] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ):
     current_trace = current_trace_context.get()
     if not current_trace:
@@ -169,6 +174,8 @@ def update_current_trace(
         current_trace.turn_id = turn_id
     if metric_collection:
         current_trace.metric_collection = metric_collection
+    if metrics:
+        current_trace.metrics = metrics
 
 
 def update_llm_span(
@@ -285,19 +292,45 @@ def update_retriever_span(
 # ---------------------------------------------------------------------------
 
 
-_pending_next_span: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+class _PendingSlot:
+    """Mutable wrapper around a pending-defaults dict.
+
+    Why a wrapper instead of putting the dict directly into the
+    ``ContextVar``: APIs like ``Agent.run_sync(...)`` call
+    ``asyncio.run(...)`` internally, which creates a NEW asyncio context
+    that inherits a *snapshot* of the parent's contextvars. A
+    ``ContextVar.set(...)`` inside that snapshot does not propagate back
+    to the outer ``with`` block — so a naive design that does
+    ``slot.set(None)`` from inside the consumer would let a second
+    ``agent.run_sync(...)`` in the same ``with`` re-consume the
+    still-populated value.
+
+    Mutating ``self.payload`` instead works because ContextVar
+    inheritance copies the REFERENCE to this wrapper. Both the outer
+    ``with`` block and the inner asyncio sub-context see the same
+    ``_PendingSlot`` instance, so ``slot.payload = None`` is visible
+    everywhere.
+    """
+
+    __slots__ = ("payload",)
+
+    def __init__(self, payload: Optional[Dict[str, Any]]):
+        self.payload: Optional[Dict[str, Any]] = payload
+
+
+_pending_next_span: ContextVar[Optional[_PendingSlot]] = ContextVar(
     "pending_next_span", default=None
 )
-_pending_next_agent_span: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+_pending_next_agent_span: ContextVar[Optional[_PendingSlot]] = ContextVar(
     "pending_next_agent_span", default=None
 )
-_pending_next_llm_span: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+_pending_next_llm_span: ContextVar[Optional[_PendingSlot]] = ContextVar(
     "pending_next_llm_span", default=None
 )
-_pending_next_tool_span: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+_pending_next_tool_span: ContextVar[Optional[_PendingSlot]] = ContextVar(
     "pending_next_tool_span", default=None
 )
-_pending_next_retriever_span: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+_pending_next_retriever_span: ContextVar[Optional[_PendingSlot]] = ContextVar(
     "pending_next_retriever_span", default=None
 )
 
@@ -324,6 +357,7 @@ def next_span(
     name: Optional[str] = None,
     test_case: Optional[LLMTestCase] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ) -> Iterator[None]:
     """Set base-span defaults for the next span of any type.
 
@@ -345,9 +379,10 @@ def next_span(
             "name": name,
             "test_case": test_case,
             "metric_collection": metric_collection,
+            "metrics": metrics,
         }
     )
-    token = _pending_next_span.set(payload)
+    token = _pending_next_span.set(_PendingSlot(payload))
     try:
         yield
     finally:
@@ -373,6 +408,7 @@ def next_agent_span(
     name: Optional[str] = None,
     test_case: Optional[LLMTestCase] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ) -> Iterator[None]:
     """Set defaults for the next ``AgentSpan``. One-stop: accepts
     agent-specific fields (``available_tools``, ``agent_handoffs``) AND
@@ -392,9 +428,10 @@ def next_agent_span(
             "name": name,
             "test_case": test_case,
             "metric_collection": metric_collection,
+            "metrics": metrics,
         }
     )
-    token = _pending_next_agent_span.set(payload)
+    token = _pending_next_agent_span.set(_PendingSlot(payload))
     try:
         yield
     finally:
@@ -425,6 +462,7 @@ def next_llm_span(
     name: Optional[str] = None,
     test_case: Optional[LLMTestCase] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ) -> Iterator[None]:
     """Set defaults for the next ``LlmSpan``. One-stop: accepts
     LLM-specific fields (``model``, token counts, ``prompt``, ...) AND
@@ -449,9 +487,10 @@ def next_llm_span(
             "name": name,
             "test_case": test_case,
             "metric_collection": metric_collection,
+            "metrics": metrics,
         }
     )
-    token = _pending_next_llm_span.set(payload)
+    token = _pending_next_llm_span.set(_PendingSlot(payload))
     try:
         yield
     finally:
@@ -476,6 +515,7 @@ def next_tool_span(
     name: Optional[str] = None,
     test_case: Optional[LLMTestCase] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ) -> Iterator[None]:
     """Set defaults for the next ``ToolSpan``. One-stop: accepts
     tool-specific fields (``description``) AND the same base fields
@@ -494,9 +534,10 @@ def next_tool_span(
             "name": name,
             "test_case": test_case,
             "metric_collection": metric_collection,
+            "metrics": metrics,
         }
     )
-    token = _pending_next_tool_span.set(payload)
+    token = _pending_next_tool_span.set(_PendingSlot(payload))
     try:
         yield
     finally:
@@ -523,6 +564,7 @@ def next_retriever_span(
     name: Optional[str] = None,
     test_case: Optional[LLMTestCase] = None,
     metric_collection: Optional[str] = None,
+    metrics: Optional[List[BaseMetric]] = None,
 ) -> Iterator[None]:
     """Set defaults for the next ``RetrieverSpan``. One-stop: accepts
     retriever-specific fields (``embedder``, ``top_k``, ``chunk_size``)
@@ -543,9 +585,10 @@ def next_retriever_span(
             "name": name,
             "test_case": test_case,
             "metric_collection": metric_collection,
+            "metrics": metrics,
         }
     )
-    token = _pending_next_retriever_span.set(payload)
+    token = _pending_next_retriever_span.set(_PendingSlot(payload))
     try:
         yield
     finally:
@@ -578,26 +621,29 @@ def pop_pending_for(span_type: Optional[str]) -> Dict[str, Any]:
     """One-shot consume the pending-defaults dict for ``span_type``.
 
     Returns a merged dict {**base_slot, **typed_slot}. Typed values win
-    on overlap. Slots that are popped are reset to ``None`` for the
-    remainder of the active scope (until the surrounding ``with`` exits
-    and restores the prior token).
+    on overlap. Drained slots have ``payload`` mutated to ``None`` —
+    NOT reassigned via ``ContextVar.set(...)``, because consumers often
+    run inside a sub-context (e.g. ``asyncio.run`` started by
+    ``Agent.run_sync``) where a ``set`` would not propagate back.
+    Mutating ``_PendingSlot.payload`` is visible in BOTH the consumer's
+    sub-context and the outer ``with`` block, since both inherit the
+    same wrapper reference.
 
     ``span_type`` may be one of ``"agent" | "llm" | "tool" |
     "retriever"`` or ``None`` to consume only the base slot.
     """
     merged: Dict[str, Any] = {}
 
-    base_payload = _pending_next_span.get()
-    if base_payload:
-        merged.update(base_payload)
-        _pending_next_span.set(None)
+    base_slot = _pending_next_span.get()
+    if base_slot is not None and base_slot.payload:
+        merged.update(base_slot.payload)
+        base_slot.payload = None
 
     if span_type and span_type in _TYPED_SLOTS:
-        slot = _TYPED_SLOTS[span_type]
-        typed_payload = slot.get()
-        if typed_payload:
-            merged.update(typed_payload)
-            slot.set(None)
+        typed_slot = _TYPED_SLOTS[span_type].get()
+        if typed_slot is not None and typed_slot.payload:
+            merged.update(typed_slot.payload)
+            typed_slot.payload = None
 
     return merged
 
