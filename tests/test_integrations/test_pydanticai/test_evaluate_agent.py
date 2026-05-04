@@ -16,9 +16,7 @@ answer_relavancy_metric = AnswerRelevancyMetric()
 agent = Agent(
     "openai:gpt-4o-mini",
     system_prompt="Be concise, reply with one sentence.",
-    instrument=ConfidentInstrumentationSettings(
-        agent_metrics=[answer_relavancy_metric],
-    ),
+    instrument=ConfidentInstrumentationSettings(),
 )
 
 

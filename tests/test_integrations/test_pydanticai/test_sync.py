@@ -10,7 +10,6 @@ from tests.test_integrations.utils import (
     is_generate_mode,
 )
 
-from deepeval.metrics import AnswerRelevancyMetric
 from tests.test_integrations.test_pydanticai.apps.eval_app import (
     create_evals_agent,
     invoke_evals_agent,
@@ -25,14 +24,8 @@ from tests.test_integrations.test_pydanticai.apps.pydanticai_tool_app import (
     create_tool_agent,
     invoke_tool_agent,
 )
-from tests.test_integrations.test_pydanticai.apps.pydanticai_prompt_app import (
-    create_prompt_agent,
-    invoke_prompt_agent,
-)
 from tests.test_integrations.test_pydanticai.apps.pydanticai_metric_collection_app import (
     create_trace_metric_collection_agent,
-    create_agent_metric_collection_agent,
-    create_llm_metric_collection_agent,
     invoke_metric_collection_agent,
 )
 from tests.test_integrations.test_pydanticai.apps.pydanticai_multiple_tools_app import (
@@ -117,56 +110,6 @@ class TestToolApp:
         assert result is not None
         assert "56" in result
 
-    @trace_test("pydanticai_tool_metric_collection_schema.json")
-    def test_tool_metric_collection(self):
-        """Test tool metric collection mapping."""
-        agent = create_tool_agent(
-            name="pydanticai-tool-metric-test",
-            tags=["pydanticai", "tool", "metric-collection"],
-            metadata={"test_type": "tool_metric_collection"},
-            thread_id="tool-metric-123",
-            user_id="test-user",
-            tool_metric_collection_map={"calculate": "calculator-metrics"},
-        )
-
-        result = invoke_tool_agent(
-            "What is 15 plus 25?",
-            agent=agent,
-        )
-
-        assert result is not None
-        assert "40" in result
-
-
-# =============================================================================
-# PROMPT TESTS (Confident Prompt attribution)
-# =============================================================================
-
-
-class TestPromptApp:
-    """Tests for PydanticAI agent with Confident Prompt logging."""
-
-    @trace_test("pydanticai_prompt_schema.json")
-    def test_prompt_attribution(self):
-        """Test that confident_prompt is logged in trace attributes."""
-        agent = create_prompt_agent(
-            prompt_alias="test-prompt-alias",
-            prompt_version="01.00.00",
-            name="pydanticai-prompt-test",
-            tags=["pydanticai", "prompt"],
-            metadata={"test_type": "prompt"},
-            thread_id="prompt-123",
-            user_id="test-user",
-        )
-
-        result = invoke_prompt_agent(
-            "Say hello in exactly two words.",
-            agent=agent,
-        )
-
-        assert result is not None
-        assert len(result) > 0
-
 
 # =============================================================================
 # METRIC COLLECTION TESTS (Online evals)
@@ -174,57 +117,22 @@ class TestPromptApp:
 
 
 class TestMetricCollectionApp:
-    """Tests for PydanticAI agent with metric collection settings."""
+    """Tests trace-level metric_collection set at runtime via
+    ``update_current_trace(metric_collection=...)`` from inside a tool.
+    Per-span metric_collection (agent / LLM / tool) is no longer a
+    settings concern — set it at the call site via
+    ``update_current_span(metric_collection=...)``.
+    """
 
     @trace_test("pydanticai_trace_metric_collection_schema.json")
     def test_trace_metric_collection(self):
-        """Test trace-level metric collection attribute."""
+        """Test trace-level metric_collection set as a settings default."""
         agent = create_trace_metric_collection_agent(
             metric_collection="test-trace-metrics",
             name="pydanticai-trace-metric-test",
             tags=["pydanticai", "trace-metric-collection"],
             metadata={"test_type": "trace_metric_collection"},
             thread_id="trace-metric-123",
-            user_id="test-user",
-        )
-
-        result = invoke_metric_collection_agent(
-            "Say hello in exactly two words.",
-            agent=agent,
-        )
-
-        assert result is not None
-        assert len(result) > 0
-
-    @trace_test("pydanticai_agent_metric_collection_schema.json")
-    def test_agent_metric_collection(self):
-        """Test agent-span-level metric collection attribute."""
-        agent = create_agent_metric_collection_agent(
-            metric_collection="test-agent-metrics",
-            name="pydanticai-agent-metric-test",
-            tags=["pydanticai", "agent-metric-collection"],
-            metadata={"test_type": "agent_metric_collection"},
-            thread_id="agent-metric-123",
-            user_id="test-user",
-        )
-
-        result = invoke_metric_collection_agent(
-            "Say hello in exactly two words.",
-            agent=agent,
-        )
-
-        assert result is not None
-        assert len(result) > 0
-
-    @trace_test("pydanticai_llm_metric_collection_schema.json")
-    def test_llm_metric_collection(self):
-        """Test LLM-span-level metric collection attribute."""
-        agent = create_llm_metric_collection_agent(
-            metric_collection="test-llm-metrics",
-            name="pydanticai-llm-metric-test",
-            tags=["pydanticai", "llm-metric-collection"],
-            metadata={"test_type": "llm_metric_collection"},
-            thread_id="llm-metric-123",
             user_id="test-user",
         )
 
@@ -320,29 +228,28 @@ class TestMultipleToolsApp:
 
 
 class TestDeepEvalFeatures:
-    """Tests for DeepEval specific features (Metric Collections, Metadata, Prompts)."""
+    """Tests for DeepEval-specific trace-level settings + metadata."""
 
     @trace_test("pydanticai_features_sync.json")
     def test_full_features_sync(self):
-        """Test passing all available DeepEval settings via instrumentation."""
-
+        """Trace-level + agent-span-level features together. Trace
+        ``metric_collection`` comes from settings (declarative default);
+        agent-span ``metric_collection`` is staged via
+        ``next_agent_span(...)`` since the user can't enter the agent
+        span body."""
         agent = create_evals_agent(
+            metric_collection="trace_metrics_override_v1",
             name="pydanticai-full-features-sync",
             tags=["pydanticai", "features", "sync"],
             metadata={"env": "testing", "priority": "high"},
             thread_id="thread-sync-features-001",
             user_id="user-sync-001",
-            metric_collection="trace_metrics_v1",
-            agent_metric_collection="agent_metrics_v1",
-            llm_metric_collection="llm_metrics_v1",
-            tool_metric_collection_map={"special_tool": "tool_metrics_v1"},
-            trace_metric_collection="trace_metrics_override_v1",
-            agent_metrics=[AnswerRelevancyMetric()],
         )
 
         result = invoke_evals_agent(
             "Use the special_tool to process 'Sync Data'",
             agent=agent,
+            agent_metric_collection="agent_metrics_v1",
         )
 
         assert result is not None

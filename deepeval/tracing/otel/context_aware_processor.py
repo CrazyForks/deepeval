@@ -102,7 +102,15 @@ class ContextAwareSpanProcessor(_SpanProcessor):
 
     @staticmethod
     def _should_route_to_rest() -> bool:
-        if current_trace_context.get() is not None:
+        # User-pushed trace contexts (via ``@observe`` / ``with trace(...)``)
+        # opt into REST routing through trace_manager. Implicit trace
+        # placeholders pushed by an OTel SpanInterceptor (only present so
+        # ``update_current_trace(...)`` works without an enclosing context)
+        # do NOT count — those callers expect OTLP behavior.
+        trace_ctx = current_trace_context.get()
+        if trace_ctx is not None and not getattr(
+            trace_ctx, "is_otel_implicit", False
+        ):
             return True
         try:
             return bool(trace_manager.is_evaluating)

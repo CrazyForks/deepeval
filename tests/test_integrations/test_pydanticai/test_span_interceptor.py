@@ -3,16 +3,19 @@
 Covers:
   - Trace-level reads from ``current_trace_context`` for ``thread_id``,
     ``name``, ``user_id``, ``tags``, ``metadata``, ``test_case_id``,
-    ``turn_id``, and trace-level ``metric_collection``.
-  - Span-level reads of per-span ``metric_collection`` from
-    ``current_agent_context`` / ``current_llm_context``.
-  - Span-context push/pop: ``current_span_context`` is set to a placeholder
-    ``BaseSpan`` for the OTel span's lifetime so ``update_current_span(...)``
-    works from anywhere in the call stack, and the placeholder's mutations
-    are serialized back into ``confident.span.*`` OTel attributes at
-    ``on_end``.
-  - ``ContextAwareSpanProcessor`` routing logic (REST when a deepeval trace
-    context is active or an evaluation is running, OTLP otherwise).
+    ``turn_id``, and ``metric_collection`` — with
+    ``ConfidentInstrumentationSettings`` trace defaults as fallback when
+    the runtime context doesn't set them.
+  - Span-context push/pop: ``current_span_context`` is set to a
+    placeholder ``BaseSpan`` for the OTel span's lifetime so
+    ``update_current_span(...)`` works from anywhere in the call stack,
+    and the placeholder's mutations are serialized back into
+    ``confident.span.*`` OTel attributes at ``on_end``.
+  - Implicit trace placeholder push for bare ``agent.run`` callers (so
+    ``update_current_trace(...)`` works without ``@observe`` /
+    ``with trace(...)``).
+  - ``ContextAwareSpanProcessor`` routing logic (REST when a deepeval
+    trace context is active or an evaluation is running, OTLP otherwise).
 """
 
 import json
@@ -23,21 +26,23 @@ import pytest
 
 from deepeval.integrations.pydantic_ai.instrumentator import SpanInterceptor
 from deepeval.tracing.context import (
+    apply_pending_to_span,
     current_span_context,
     current_trace_context,
+    next_agent_span,
+    next_llm_span,
+    next_retriever_span,
+    next_span,
+    next_tool_span,
+    pop_pending_for,
     update_current_span,
     update_current_trace,
 )
+from deepeval.tracing.types import AgentSpan, BaseSpan, TraceSpanStatus
 from deepeval.tracing.otel.context_aware_processor import (
     ContextAwareSpanProcessor,
 )
-from deepeval.tracing.trace_context import (
-    AgentSpanContext,
-    LlmSpanContext,
-    current_agent_context,
-    current_llm_context,
-    trace,
-)
+from deepeval.tracing.trace_context import trace
 
 
 _span_id_counter = count(start=1)
@@ -76,9 +81,15 @@ def _make_mock_span(operation_name=None, agent_name=None, tool_name=None):
 def _make_settings(**kwargs):
     """Return a minimal mock ``ConfidentInstrumentationSettings``.
 
-    Only the attributes ``SpanInterceptor`` reads are populated. Anything not
-    provided defaults to ``None`` so the context-vs-settings precedence logic
-    is exercised cleanly.
+    Only the attributes ``SpanInterceptor`` actually reads are populated.
+    Anything not provided defaults to ``None`` so the
+    context-vs-settings precedence logic is exercised cleanly.
+
+    Settings now carries only trace-level fields (no per-span
+    metric_collection / prompt / agent_metrics) — this mirrors the
+    refactor that moved span-level configuration entirely to
+    ``update_current_span(...)``. Trace-level ``metric_collection``
+    remains because it lives on the ``Trace`` (not on a span).
     """
     settings = MagicMock(spec=[])  # spec=[] disallows auto-attrs
     settings.thread_id = kwargs.get("thread_id")
@@ -86,18 +97,10 @@ def _make_settings(**kwargs):
     settings.metadata = kwargs.get("metadata")
     settings.user_id = kwargs.get("user_id")
     settings.tags = kwargs.get("tags")
+    settings.metric_collection = kwargs.get("metric_collection")
     settings.test_case_id = kwargs.get("test_case_id")
     settings.turn_id = kwargs.get("turn_id")
-    settings.metric_collection = kwargs.get("metric_collection")
-    settings.trace_metric_collection = kwargs.get("trace_metric_collection")
     settings.environment = kwargs.get("environment")
-    settings.confident_prompt = kwargs.get("confident_prompt")
-    settings.llm_metric_collection = kwargs.get("llm_metric_collection")
-    settings.agent_metric_collection = kwargs.get("agent_metric_collection")
-    settings.tool_metric_collection_map = kwargs.get(
-        "tool_metric_collection_map", {}
-    )
-    settings.agent_metrics = kwargs.get("agent_metrics")
     return settings
 
 
@@ -242,11 +245,10 @@ class TestSpanInterceptorNewTraceContextReads:
         assert span.attributes.get("confident.trace.turn_id") == "ctx-turn"
 
     def test_trace_metric_collection_resolution_order(self):
-        """trace_ctx.metric_collection > settings.trace_metric_collection > settings.metric_collection."""
-        settings = _make_settings(
-            metric_collection="settings-mc",
-            trace_metric_collection="settings-trace-mc",
-        )
+        """``metric_collection`` resolves runtime-context-first, settings
+        as fallback — same precedence as the other trace-level fields.
+        The runtime call wins on the value it touches."""
+        settings = _make_settings(metric_collection="settings-mc")
         interceptor = SpanInterceptor(settings)
         span = _make_mock_span()
 
@@ -294,12 +296,12 @@ class TestSpanInterceptorNewTraceContextReads:
         }
 
     def test_trace_metric_collection_falls_back_to_settings(self):
+        """Without a runtime ``metric_collection`` set, the
+        ``ConfidentInstrumentationSettings`` default is used — same
+        fallback behavior as ``name`` / ``user_id`` / etc."""
         token = current_trace_context.set(None)
         try:
-            settings = _make_settings(
-                metric_collection="settings-mc",
-                trace_metric_collection="settings-trace-mc",
-            )
+            settings = _make_settings(metric_collection="settings-mc")
             interceptor = SpanInterceptor(settings)
             span = _make_mock_span()
 
@@ -308,72 +310,28 @@ class TestSpanInterceptorNewTraceContextReads:
 
             assert (
                 span.attributes.get("confident.trace.metric_collection")
-                == "settings-trace-mc"
+                == "settings-mc"
             )
         finally:
             current_trace_context.reset(token)
 
-
-# ---------------------------------------------------------------------------
-# Span-context reads for per-span metric_collection
-# ---------------------------------------------------------------------------
-
-
-class TestSpanInterceptorSpanContextMetricCollection:
-    def test_llm_metric_collection_from_llm_context_overrides_settings(self):
-        settings = _make_settings(llm_metric_collection="settings-llm-mc")
-        interceptor = SpanInterceptor(settings)
-        span = _make_mock_span(operation_name="chat")
-
-        token = current_llm_context.set(
-            LlmSpanContext(metric_collection="ctx-llm-mc")
-        )
+    def test_trace_metric_collection_omitted_when_neither_set(self):
+        """No ``confident.trace.metric_collection`` attr is written when
+        neither settings nor the runtime context provide a value."""
+        token = current_trace_context.set(None)
         try:
+            settings = _make_settings()
+            interceptor = SpanInterceptor(settings)
+            span = _make_mock_span()
+
             interceptor.on_start(span, None)
+            interceptor.on_end(span)
+
+            assert (
+                span.attributes.get("confident.trace.metric_collection") is None
+            )
         finally:
-            current_llm_context.reset(token)
-
-        assert (
-            span.attributes.get("confident.span.metric_collection")
-            == "ctx-llm-mc"
-        )
-
-    def test_agent_metric_collection_from_agent_context_overrides_settings(
-        self,
-    ):
-        settings = _make_settings(agent_metric_collection="settings-agent-mc")
-        interceptor = SpanInterceptor(settings)
-        span = _make_mock_span(
-            operation_name="invoke_agent", agent_name="my-agent"
-        )
-
-        token = current_agent_context.set(
-            AgentSpanContext(metric_collection="ctx-agent-mc")
-        )
-        try:
-            interceptor.on_start(span, None)
-        finally:
-            current_agent_context.reset(token)
-
-        assert (
-            span.attributes.get("confident.span.metric_collection")
-            == "ctx-agent-mc"
-        )
-
-    def test_tool_metric_collection_still_uses_settings_map(self):
-        """Tool spans use ``tool_metric_collection_map`` only; no per-context override."""
-        settings = _make_settings(
-            tool_metric_collection_map={"my_tool": "settings-tool-mc"},
-        )
-        interceptor = SpanInterceptor(settings)
-        span = _make_mock_span(tool_name="my_tool")
-
-        interceptor.on_start(span, None)
-
-        assert (
-            span.attributes.get("confident.span.metric_collection")
-            == "settings-tool-mc"
-        )
+            current_trace_context.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +417,125 @@ class TestSpanInterceptorSpanContextPushPop:
 
 
 # ---------------------------------------------------------------------------
+# Implicit trace context push/pop: enables update_current_trace(...) without
+# an enclosing @observe / with trace(...) (bare ``agent.run`` callers).
+# ---------------------------------------------------------------------------
+
+
+class TestSpanInterceptorImplicitTraceContext:
+    """Symmetric to ``TestSpanInterceptorSpanContextPushPop`` but at the
+    trace level. The interceptor pushes an implicit ``Trace`` placeholder
+    onto ``current_trace_context`` for the OTel root span's lifetime so
+    ``update_current_trace(...)`` from inside tools / nested helpers can
+    mutate something. The placeholder is tagged ``is_otel_implicit=True``
+    so ``ContextAwareSpanProcessor`` keeps routing to OTLP.
+    """
+
+    def test_root_span_pushes_implicit_trace_when_no_user_context(self):
+        token = current_trace_context.set(None)
+        try:
+            settings = _make_settings()
+            interceptor = SpanInterceptor(settings)
+            root = _make_mock_span()  # parent=None by default
+
+            interceptor.on_start(root, None)
+            during = current_trace_context.get()
+
+            assert during is not None
+            assert getattr(during, "is_otel_implicit", False) is True
+
+            interceptor.on_end(root)
+            assert current_trace_context.get() is None
+        finally:
+            current_trace_context.reset(token)
+
+    def test_does_not_overwrite_user_pushed_trace_context(self):
+        """If the caller is already inside @observe / with trace(...),
+        the interceptor must NOT clobber their Trace."""
+        settings = _make_settings()
+        interceptor = SpanInterceptor(settings)
+        root = _make_mock_span()
+
+        with trace() as user_trace:
+            assert getattr(user_trace, "is_otel_implicit", False) is False
+
+            interceptor.on_start(root, None)
+            during = current_trace_context.get()
+
+            # Same object as the user's trace — no implicit push happened.
+            assert during is user_trace
+            assert getattr(during, "is_otel_implicit", False) is False
+
+            interceptor.on_end(root)
+
+            # User trace still in place after on_end (nothing was popped
+            # because nothing was pushed).
+            assert current_trace_context.get() is user_trace
+
+    def test_child_span_does_not_push_its_own_placeholder(self):
+        """Only the OTel root span pushes; child spans inherit via
+        contextvars and never call ``current_trace_context.set``.
+        """
+        token = current_trace_context.set(None)
+        try:
+            settings = _make_settings()
+            interceptor = SpanInterceptor(settings)
+            root = _make_mock_span()
+            child = _make_mock_span()
+            child.parent = MagicMock()  # non-None marks it as a child
+
+            interceptor.on_start(root, None)
+            implicit = current_trace_context.get()
+            assert implicit is not None
+
+            interceptor.on_start(child, None)
+            # Child sees the same implicit placeholder via contextvars; no
+            # second push happened.
+            assert current_trace_context.get() is implicit
+
+            interceptor.on_end(child)
+            # Child's on_end must not pop the root's placeholder.
+            assert current_trace_context.get() is implicit
+
+            interceptor.on_end(root)
+            assert current_trace_context.get() is None
+        finally:
+            current_trace_context.reset(token)
+
+    def test_update_current_trace_in_implicit_context_lands_on_otel_attrs(
+        self,
+    ):
+        """The whole point of the implicit push: bare callers can use
+        ``update_current_trace(...)`` from inside a tool body and have
+        the values flow into ``confident.trace.*`` OTel attrs.
+        """
+        token = current_trace_context.set(None)
+        try:
+            settings = _make_settings()
+            interceptor = SpanInterceptor(settings)
+            root = _make_mock_span()
+
+            interceptor.on_start(root, None)
+            update_current_trace(
+                name="bare-trace",
+                user_id="user-bare",
+                tags=["bare"],
+                metadata={"source": "tool", "request_id": "req-bare-1"},
+            )
+            interceptor.on_end(root)
+
+            assert root.attributes.get("confident.trace.name") == "bare-trace"
+            assert root.attributes.get("confident.trace.user_id") == "user-bare"
+            assert root.attributes.get("confident.trace.tags") == ["bare"]
+            assert json.loads(root.attributes["confident.trace.metadata"]) == {
+                "source": "tool",
+                "request_id": "req-bare-1",
+            }
+        finally:
+            current_trace_context.reset(token)
+
+
+# ---------------------------------------------------------------------------
 # ContextAwareSpanProcessor routing
 # ---------------------------------------------------------------------------
 
@@ -473,9 +550,7 @@ class TestContextAwareSpanProcessorRouting:
         """Bypass ``__init__`` so the test doesn't depend on the OTLP exporter
         package being installed locally — we only care about routing logic.
         """
-        processor = ContextAwareSpanProcessor.__new__(
-            ContextAwareSpanProcessor
-        )
+        processor = ContextAwareSpanProcessor.__new__(ContextAwareSpanProcessor)
         processor._api_key = "test-key"
         processor._rest_processor = MagicMock()
         processor._otlp_processor = MagicMock()
@@ -525,6 +600,64 @@ class TestContextAwareSpanProcessorRouting:
         rest.on_end.assert_called_once_with(span)
         otlp.on_end.assert_not_called()
 
+    def test_routes_to_otlp_when_only_implicit_trace_in_context(self):
+        """Implicit Trace placeholders (pushed by SpanInterceptor for
+        bare ``agent.run`` callers) MUST NOT flip routing to REST —
+        they only exist so ``update_current_trace(...)`` works."""
+        from deepeval.tracing.types import Trace, TraceSpanStatus
+
+        processor, rest, otlp = self._make_processor()
+        span = _FakeSpan()
+
+        implicit_trace = Trace(
+            uuid="abc",
+            root_spans=[],
+            status=TraceSpanStatus.IN_PROGRESS,
+            start_time=0.0,
+            is_otel_implicit=True,
+        )
+        token = current_trace_context.set(implicit_trace)
+        try:
+            with patch(
+                "deepeval.tracing.otel.context_aware_processor.trace_manager"
+            ) as fake_tm:
+                fake_tm.is_evaluating = False
+                processor.on_end(span)
+        finally:
+            current_trace_context.reset(token)
+
+        otlp.on_end.assert_called_once_with(span)
+        rest.on_end.assert_not_called()
+
+    def test_routes_to_rest_when_evaluating_even_with_implicit_trace(self):
+        """``trace_manager.is_evaluating`` overrides everything — a live
+        eval session must see spans via REST regardless of how the trace
+        context was pushed."""
+        from deepeval.tracing.types import Trace, TraceSpanStatus
+
+        processor, rest, otlp = self._make_processor()
+        span = _FakeSpan()
+
+        implicit_trace = Trace(
+            uuid="abc",
+            root_spans=[],
+            status=TraceSpanStatus.IN_PROGRESS,
+            start_time=0.0,
+            is_otel_implicit=True,
+        )
+        token = current_trace_context.set(implicit_trace)
+        try:
+            with patch(
+                "deepeval.tracing.otel.context_aware_processor.trace_manager"
+            ) as fake_tm:
+                fake_tm.is_evaluating = True
+                processor.on_end(span)
+        finally:
+            current_trace_context.reset(token)
+
+        rest.on_end.assert_called_once_with(span)
+        otlp.on_end.assert_not_called()
+
     def test_on_start_forwarded_to_both(self):
         processor, rest, otlp = self._make_processor()
         span = _FakeSpan()
@@ -562,3 +695,383 @@ def test_is_test_mode_kwarg_is_removed_from_settings():
 
     with pytest.raises(TypeError):
         ConfidentInstrumentationSettings(api_key="dummy", is_test_mode=False)
+
+
+# ---------------------------------------------------------------------------
+# Span-related kwargs are gone for good — they intentionally have NO
+# settings-level fallback. Per-span configuration is a runtime concern
+# (``update_current_span(...)`` from inside your tool / agent body).
+#
+# ``metric_collection`` is NOT in this list — it lives on the ``Trace``
+# (a trace-level field, alongside ``name`` / ``tags`` / etc.) and remains
+# an accepted ``ConfidentInstrumentationSettings`` kwarg as a
+# trace-default. ``trace_metric_collection`` was a redundant alias and IS
+# removed; use ``metric_collection`` instead.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwarg",
+    [
+        "confident_prompt",
+        "trace_metric_collection",
+        "llm_metric_collection",
+        "agent_metric_collection",
+        "tool_metric_collection_map",
+        "agent_metrics",
+    ],
+)
+def test_span_related_kwargs_are_removed_from_settings(kwarg):
+    """Dropped span-level kwargs must raise TypeError on construction."""
+    from deepeval.integrations.pydantic_ai.instrumentator import (
+        ConfidentInstrumentationSettings,
+    )
+
+    with pytest.raises(TypeError):
+        ConfidentInstrumentationSettings(api_key="dummy", **{kwarg: object()})
+
+
+# ---------------------------------------------------------------------------
+# next_*_span context managers — pure context-API behavior.
+#
+# These tests don't touch the SpanInterceptor; they verify the
+# ``pop_pending_for(...)`` / ``apply_pending_to_span(...)`` contracts in
+# isolation so we can assert the consumption semantics independently of
+# any integration that wires them up.
+# ---------------------------------------------------------------------------
+
+
+class TestNextSpanPureContextAPI:
+    def test_pop_outside_with_returns_empty(self):
+        """No pending slot → popping returns an empty dict, never None."""
+        assert pop_pending_for("agent") == {}
+        assert pop_pending_for(None) == {}
+
+    def test_next_agent_span_one_shot_consumption(self):
+        """First pop drains; second pop returns empty for the same scope."""
+        with next_agent_span(metric_collection="A", available_tools=["x"]):
+            first = pop_pending_for("agent")
+            assert first == {
+                "metric_collection": "A",
+                "available_tools": ["x"],
+            }
+
+            second = pop_pending_for("agent")
+            assert second == {}
+
+    def test_scope_exit_restores_prior_value(self):
+        """Token-based reset: leaving the ``with`` block puts the slot
+        back to ``None`` (not just empty-dict)."""
+        with next_agent_span(metric_collection="A"):
+            pass
+
+        # After exit, popping yields nothing — slot is back to None.
+        assert pop_pending_for("agent") == {}
+
+    def test_stacked_typed_slots_are_independent(self):
+        """``with next_agent_span(...), next_llm_span(...):`` keeps each
+        slot separate; popping one does not drain the other."""
+        with next_agent_span(metric_collection="A"), next_llm_span(
+            model="gpt-4"
+        ):
+            agent_payload = pop_pending_for("agent")
+            assert agent_payload == {"metric_collection": "A"}
+
+            llm_payload = pop_pending_for("llm")
+            assert llm_payload == {"model": "gpt-4"}
+
+    def test_base_slot_consumed_by_first_typed_pop(self):
+        """``next_span`` is "next of any type"; the first ``pop_pending_for``
+        call inside the scope drains it regardless of typed slot match."""
+        with next_span(metadata={"k": "v"}):
+            first = pop_pending_for("agent")
+            assert first == {"metadata": {"k": "v"}}
+
+            # Subsequent pops see no base slot.
+            assert pop_pending_for("llm") == {}
+
+    def test_typed_overrides_base_on_key_overlap(self):
+        """When base + typed both set the same key, the typed slot wins
+        (more specific wins)."""
+        with next_span(metric_collection="base"), next_agent_span(
+            metric_collection="typed"
+        ):
+            payload = pop_pending_for("agent")
+            assert payload["metric_collection"] == "typed"
+
+    def test_pop_for_mismatched_type_drains_only_base(self):
+        """``next_agent_span(...)`` is NOT consumed by
+        ``pop_pending_for('llm')``. Base slot still goes (it's
+        any-type)."""
+        with next_span(metadata={"k": "v"}), next_agent_span(
+            metric_collection="A"
+        ):
+            llm_payload = pop_pending_for("llm")
+            # Base flowed through, agent slot untouched.
+            assert llm_payload == {"metadata": {"k": "v"}}
+
+            agent_payload = pop_pending_for("agent")
+            assert agent_payload == {"metric_collection": "A"}
+
+    def test_nested_same_type_innermost_wins(self):
+        """Nested ``with next_agent_span(...)`` blocks: inner overrides
+        for its scope; on exit, outer is restored."""
+        with next_agent_span(metric_collection="outer"):
+            with next_agent_span(metric_collection="inner"):
+                assert pop_pending_for("agent") == {
+                    "metric_collection": "inner"
+                }
+
+            # Outer scope's value is back, ready to be consumed once.
+            assert pop_pending_for("agent") == {"metric_collection": "outer"}
+
+    def test_drops_none_kwargs(self):
+        """Slots store only kwargs the user actually passed; ``None``
+        kwargs are stripped so consumers don't have to re-check."""
+        with next_agent_span(metric_collection="A"):
+            payload = pop_pending_for("agent")
+            assert "available_tools" not in payload
+            assert "name" not in payload
+            assert "metadata" not in payload
+
+    def test_unconsumed_payload_does_not_leak_across_scopes(self):
+        """If no consumer pops inside the ``with``, the payload is
+        discarded on exit — it never leaks to a sibling scope."""
+        with next_agent_span(metric_collection="leaked"):
+            pass  # nobody popped
+
+        # Sibling scope: starts clean.
+        with next_agent_span(metric_collection="fresh"):
+            assert pop_pending_for("agent") == {"metric_collection": "fresh"}
+
+    def test_other_typed_helpers_each_use_their_own_slot(self):
+        """Smoke test that ``next_tool_span`` / ``next_retriever_span``
+        wire up to their respective slots (not the base/agent/llm
+        slots)."""
+        with next_tool_span(description="foo"):
+            assert pop_pending_for("tool") == {"description": "foo"}
+            assert pop_pending_for("agent") == {}
+
+        with next_retriever_span(top_k=3, embedder="ada-002"):
+            assert pop_pending_for("retriever") == {
+                "top_k": 3,
+                "embedder": "ada-002",
+            }
+
+
+# ---------------------------------------------------------------------------
+# apply_pending_to_span — placeholder mutation behavior.
+# ---------------------------------------------------------------------------
+
+
+def _make_placeholder(cls=BaseSpan, **kw) -> BaseSpan:
+    """Helper to build a minimal placeholder for applier tests."""
+    base_kwargs = {
+        "uuid": "u-1",
+        "trace_uuid": "t-1",
+        "status": TraceSpanStatus.IN_PROGRESS,
+        "start_time": 0.0,
+    }
+    if cls is AgentSpan:
+        base_kwargs.setdefault("name", "agent")
+    base_kwargs.update(kw)
+    return cls(**base_kwargs)
+
+
+class TestApplyPendingToSpan:
+    def test_empty_payload_is_noop(self):
+        span = _make_placeholder()
+        apply_pending_to_span(span, {})
+        # Nothing changed — sanity.
+        assert span.metric_collection is None
+        assert span.metadata is None
+
+    def test_base_field_setattr(self):
+        span = _make_placeholder()
+        apply_pending_to_span(
+            span,
+            {"metric_collection": "mc", "metadata": {"k": "v"}, "name": "n"},
+        )
+        assert span.metric_collection == "mc"
+        assert span.metadata == {"k": "v"}
+        assert span.name == "n"
+
+    def test_agent_specific_fields_apply_only_to_agent_span(self):
+        agent = _make_placeholder(AgentSpan)
+        apply_pending_to_span(
+            agent,
+            {"available_tools": ["a", "b"], "agent_handoffs": ["h1"]},
+        )
+        assert agent.available_tools == ["a", "b"]
+        assert agent.agent_handoffs == ["h1"]
+
+    def test_cross_type_keys_silently_dropped(self):
+        """Applier is hasattr-guarded: typed kwargs that don't apply to
+        the placeholder's class are silently skipped instead of raising."""
+        base = _make_placeholder()  # plain BaseSpan, no model/embedder/etc.
+        apply_pending_to_span(
+            base,
+            {
+                "model": "gpt-4",  # llm-only
+                "embedder": "ada",  # retriever-only
+                "available_tools": ["x"],  # agent-only
+                "metric_collection": "shared",  # base — should land
+            },
+        )
+        # Only the shared base field landed.
+        assert base.metric_collection == "shared"
+        # Cross-type keys did not raise and did not phantom-attribute.
+        assert not hasattr(base, "model")
+        assert not hasattr(base, "embedder")
+
+    def test_test_case_unpacking_then_individual_fields_override(self):
+        """``test_case`` is unpacked first, then individual base fields
+        applied — so individual kwargs override the test_case's
+        equivalent fields. Mirrors ``update_current_span(...)``'s order
+        of operations (test_case first, then ``input``/``output``/etc.).
+        Asserting this so the contract doesn't quietly flip."""
+        from deepeval.test_case.llm_test_case import LLMTestCase
+
+        span = _make_placeholder()
+        tc = LLMTestCase(
+            input="tc-input",
+            actual_output="tc-output",
+            expected_output="tc-expected",
+        )
+        apply_pending_to_span(
+            span,
+            {
+                "test_case": tc,
+                "input": "individual-input",  # overrides tc.input
+                "output": "individual-output",  # overrides tc.actual_output
+                # expected_output not overridden — falls through to tc.
+            },
+        )
+        assert span.input == "individual-input"
+        assert span.output == "individual-output"
+        assert span.expected_output == "tc-expected"
+
+
+# ---------------------------------------------------------------------------
+# next_*_span ↔ SpanInterceptor wiring: end-to-end behavior.
+#
+# Verifies that ``with next_*_span(...)`` defaults actually land on the
+# placeholder pushed by ``SpanInterceptor._push_span_context`` and end
+# up in the OTel ``confident.span.*`` attrs after on_end.
+# ---------------------------------------------------------------------------
+
+
+def _make_agent_span_mock(agent_name="agent_x"):
+    """Mock a pydantic-ai-style root agent span (operation_name=invoke_agent
+    so SpanInterceptor classifies it as agent)."""
+    return _make_mock_span(operation_name="invoke_agent", agent_name=agent_name)
+
+
+class TestNextSpanInterceptorIntegration:
+    def test_next_agent_span_metric_collection_lands_on_otel_attrs(self):
+        """``with next_agent_span(metric_collection=...)`` is consumed by
+        the interceptor's ``_push_span_context`` for the agent span and
+        emitted as ``confident.span.metric_collection``."""
+        settings = _make_settings()
+        interceptor = SpanInterceptor(settings)
+        span = _make_agent_span_mock()
+
+        with next_agent_span(metric_collection="agent_metrics_v1"):
+            interceptor.on_start(span, None)
+            interceptor.on_end(span)
+
+        assert (
+            span.attributes.get("confident.span.metric_collection")
+            == "agent_metrics_v1"
+        )
+
+    def test_next_agent_span_consumed_only_by_first_agent_span(self):
+        """One-shot semantics through the interceptor: a second agent
+        span inside the same ``with`` block does NOT inherit."""
+        settings = _make_settings()
+        interceptor = SpanInterceptor(settings)
+        first = _make_agent_span_mock("agent_one")
+        second = _make_agent_span_mock("agent_two")
+
+        with next_agent_span(metric_collection="only-first"):
+            interceptor.on_start(first, None)
+            interceptor.on_end(first)
+
+            interceptor.on_start(second, None)
+            interceptor.on_end(second)
+
+        assert (
+            first.attributes.get("confident.span.metric_collection")
+            == "only-first"
+        )
+        assert second.attributes.get("confident.span.metric_collection") is None
+
+    def test_next_agent_span_does_not_affect_non_agent_span(self):
+        """Typed slot is NOT consumed by spans of a different type. An
+        LLM span fired inside ``with next_agent_span(...)`` should pop
+        nothing from the agent slot. The agent slot is still available
+        for a subsequent agent span."""
+        settings = _make_settings()
+        interceptor = SpanInterceptor(settings)
+        llm_span = _make_mock_span(operation_name="chat")
+        agent_span = _make_agent_span_mock()
+
+        with next_agent_span(metric_collection="agent-only"):
+            interceptor.on_start(llm_span, None)
+            interceptor.on_end(llm_span)
+
+            interceptor.on_start(agent_span, None)
+            interceptor.on_end(agent_span)
+
+        assert (
+            llm_span.attributes.get("confident.span.metric_collection") is None
+        )
+        assert (
+            agent_span.attributes.get("confident.span.metric_collection")
+            == "agent-only"
+        )
+
+    def test_next_agent_span_metadata_lands_on_agent_placeholder(self):
+        """``next_agent_span(metadata=...)`` flows through to the
+        placeholder and is serialized to ``confident.span.metadata`` at
+        on_end. Verifies non-metric_collection base kwargs make it
+        through the consumption + serialization pipeline."""
+        settings = _make_settings()
+        interceptor = SpanInterceptor(settings)
+        span = _make_agent_span_mock()
+
+        with next_agent_span(metadata={"flow_check": "ok", "phase": "init"}):
+            interceptor.on_start(span, None)
+            # Placeholder is what next_agent_span wrote to.
+            placeholder = current_span_context.get()
+            assert placeholder.metadata == {
+                "flow_check": "ok",
+                "phase": "init",
+            }
+            interceptor.on_end(span)
+
+        assert json.loads(span.attributes["confident.span.metadata"]) == {
+            "flow_check": "ok",
+            "phase": "init",
+        }
+
+    def test_update_current_span_overrides_next_agent_span_after_creation(
+        self,
+    ):
+        """Last-write-wins: ``next_agent_span`` sets the floor at
+        on_start; later ``update_current_span(...)`` calls (e.g. from
+        inside a tool body that walks up to the agent placeholder)
+        overwrite. Mirrors the trace-level precedence story."""
+        settings = _make_settings()
+        interceptor = SpanInterceptor(settings)
+        span = _make_agent_span_mock()
+
+        with next_agent_span(metric_collection="from-wrapper"):
+            interceptor.on_start(span, None)
+            update_current_span(metric_collection="from-update")
+            interceptor.on_end(span)
+
+        assert (
+            span.attributes.get("confident.span.metric_collection")
+            == "from-update"
+        )

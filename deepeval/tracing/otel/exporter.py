@@ -132,9 +132,7 @@ class ConfidentSpanExporter(SpanExporter):
                 # land in the existing trace_manager entry rather than
                 # creating a phantom duplicate keyed by the OTel trace_id.
                 if target_trace_uuid:
-                    base_span_wrapper.base_span.trace_uuid = (
-                        target_trace_uuid
-                    )
+                    base_span_wrapper.base_span.trace_uuid = target_trace_uuid
 
                 spans_wrappers_list.append(base_span_wrapper)
             spans_wrappers_forest.append(spans_wrappers_list)
@@ -185,9 +183,7 @@ class ConfidentSpanExporter(SpanExporter):
         if in_active_context:
             for spans_wrappers_list in spans_wrappers_forest:
                 for base_span_wrapper in spans_wrappers_list:
-                    trace_manager.remove_span(
-                        base_span_wrapper.base_span.uuid
-                    )
+                    trace_manager.remove_span(base_span_wrapper.base_span.uuid)
             return SpanExportResult.SUCCESS
 
         # safely end all active traces or return them for test runs

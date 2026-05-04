@@ -27,6 +27,8 @@ Requirements:
 """
 
 import os
+import uuid
+from pathlib import Path
 
 from pydantic_ai import Agent
 
@@ -36,6 +38,12 @@ from deepeval.tracing import (
     update_current_trace,
 )
 from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+
+
+# Unique per-script-run id so every trace produced by this run can be
+# grouped in the dashboard via metadata.run_id (more reliable than
+# filtering by timestamp).
+RUN_ID = f"{Path(__file__).stem}-{uuid.uuid4().hex[:8]}"
 
 
 settings = ConfidentInstrumentationSettings()
@@ -62,7 +70,11 @@ def answer(query: str, request_id: str) -> str:
         thread_id="thread-123",
         user_id="user-abc",
         tags=["after-rewrite"],
-        metadata={"source": "runtime", "request_id": request_id},
+        metadata={
+            "source": "runtime",
+            "request_id": request_id,
+            "run_id": RUN_ID,
+        },
     )
     return agent.run_sync(query).output
 
@@ -76,7 +88,8 @@ def main() -> None:
     output = answer("What's the weather in Paris?", request_id="req-001")
     print(output)
     print(
-        "\nOpen the Confident AI dashboard. The trace will show the "
+        f"\nAll traces from this run share metadata.run_id = '{RUN_ID}'.\n"
+        "Open the Confident AI dashboard. The trace will show the "
         "runtime metadata (user_id=user-abc, tags=[after-rewrite], "
         "metadata.request_id=req-001) AND the get_weather tool span will "
         "carry metadata.weather_source=mock and metadata.city=Paris."

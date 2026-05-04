@@ -15,7 +15,6 @@ def create_tool_agent(
     metadata: dict = None,
     thread_id: str = None,
     user_id: str = None,
-    tool_metric_collection_map: dict = None,
 ) -> Agent:
     """Create a PydanticAI agent with tools and instrumentation settings."""
     settings = ConfidentInstrumentationSettings(
@@ -24,7 +23,6 @@ def create_tool_agent(
         metadata=metadata or {"test_type": "tool"},
         thread_id=thread_id,
         user_id=user_id,
-        tool_metric_collection_map=tool_metric_collection_map or {},
     )
 
     agent = Agent(

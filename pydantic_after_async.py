@@ -31,6 +31,8 @@ Requirements:
 
 import asyncio
 import os
+import uuid
+from pathlib import Path
 
 from pydantic_ai import Agent
 
@@ -40,6 +42,11 @@ from deepeval.tracing import (
     update_current_trace,
 )
 from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+
+
+# Unique per-script-run id so every trace produced by this run can be
+# grouped in the dashboard via metadata.run_id.
+RUN_ID = f"{Path(__file__).stem}-{uuid.uuid4().hex[:8]}"
 
 
 settings = ConfidentInstrumentationSettings()
@@ -70,7 +77,11 @@ async def answer(query: str, request_id: str) -> str:
         thread_id="thread-async-123",
         user_id="user-async",
         tags=["async-pure", "after-rewrite"],
-        metadata={"source": "runtime-async", "request_id": request_id},
+        metadata={
+            "source": "runtime-async",
+            "request_id": request_id,
+            "run_id": RUN_ID,
+        },
     )
     result = await agent.run(query)
     return result.output
@@ -87,7 +98,8 @@ async def main() -> None:
     )
     print(output)
     print(
-        "\nOpen the Confident AI dashboard. The trace should show:\n"
+        f"\nAll traces from this run share metadata.run_id = '{RUN_ID}'.\n"
+        "Open the Confident AI dashboard. The trace should show:\n"
         "  - name: pydantic-ai-async-validation\n"
         "  - user_id=user-async, thread_id=thread-async-123\n"
         "  - tags=[async-pure, after-rewrite]\n"

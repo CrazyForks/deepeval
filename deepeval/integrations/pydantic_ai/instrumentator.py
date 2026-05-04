@@ -8,16 +8,12 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from deepeval.config.settings import get_settings
 from deepeval.confident.api import get_confident_api_key
-from deepeval.metrics.base_metric import BaseMetric
-from deepeval.prompt import Prompt
 from deepeval.tracing import perf_epoch_bridge as peb
 from deepeval.tracing.context import (
+    apply_pending_to_span,
     current_span_context,
     current_trace_context,
-)
-from deepeval.tracing.trace_context import (
-    current_agent_context,
-    current_llm_context,
+    pop_pending_for,
 )
 from deepeval.tracing.otel.context_aware_processor import (
     ContextAwareSpanProcessor,
@@ -30,6 +26,7 @@ from deepeval.tracing.tracing import trace_manager
 from deepeval.tracing.types import (
     AgentSpan,
     BaseSpan,
+    Trace,
     TraceSpanStatus,
 )
 
@@ -120,6 +117,31 @@ init_clock_bridge()  # initialize clock bridge for perf_counter() to epoch_nanos
 
 
 class ConfidentInstrumentationSettings(InstrumentationSettings):
+    """Pydantic AI ``InstrumentationSettings`` that wires deepeval's OTel
+    pipeline.
+
+    Construction does the non-negotiable plumbing — creates a
+    ``TracerProvider``, registers ``SpanInterceptor`` and
+    ``ContextAwareSpanProcessor``, sets the global tracer provider, and
+    forwards itself to ``Agent(instrument=...)``. The constructor is
+    required for the integration to work; you cannot use the runtime
+    helpers (``update_current_trace`` / ``update_current_span``) to
+    bootstrap the OTel pipeline.
+
+    Trace-level kwargs (``name``, ``thread_id``, ``user_id``,
+    ``metadata``, ``tags``, ``metric_collection``, ``test_case_id``,
+    ``turn_id``) are convenience defaults stamped onto every trace
+    produced by this agent. They are ALWAYS overridable at runtime via
+    ``update_current_trace(...)`` from anywhere in the call stack — the
+    runtime call wins on any field it touches. Settings defaults exist
+    purely to save boilerplate when every trace from this agent should
+    carry the same value.
+
+    Span-level configuration intentionally lives only at the call site:
+    use ``update_current_span(metric_collection=..., metadata=..., ...)``
+    from inside your tool / agent body. The span placeholder pushed by
+    ``SpanInterceptor.on_start`` is the write target.
+    """
 
     def __init__(
         self,
@@ -130,14 +152,8 @@ class ConfidentInstrumentationSettings(InstrumentationSettings):
         metadata: Optional[dict] = None,
         tags: Optional[List[str]] = None,
         metric_collection: Optional[str] = None,
-        confident_prompt: Optional[Prompt] = None,
-        llm_metric_collection: Optional[str] = None,
-        agent_metric_collection: Optional[str] = None,
-        tool_metric_collection_map: Optional[dict] = None,
-        trace_metric_collection: Optional[str] = None,
         test_case_id: Optional[str] = None,
         turn_id: Optional[str] = None,
-        agent_metrics: Optional[List[BaseMetric]] = None,
     ):
         is_dependency_installed()
 
@@ -155,20 +171,14 @@ class ConfidentInstrumentationSettings(InstrumentationSettings):
         ]:
             self.environment = _environment
 
-        self.tool_metric_collection_map = tool_metric_collection_map or {}
         self.name = name
         self.thread_id = thread_id
         self.user_id = user_id
         self.metadata = metadata
         self.tags = tags
         self.metric_collection = metric_collection
-        self.confident_prompt = confident_prompt
-        self.llm_metric_collection = llm_metric_collection
-        self.agent_metric_collection = agent_metric_collection
-        self.trace_metric_collection = trace_metric_collection
         self.test_case_id = test_case_id
         self.turn_id = turn_id
-        self.agent_metrics = agent_metrics
 
         if not api_key:
             api_key = get_confident_api_key()
@@ -202,20 +212,23 @@ class SpanInterceptor(SpanProcessor):
     """Translate Pydantic AI OTel spans into deepeval ``confident.*`` attrs.
 
     Trace-level attrs (``confident.trace.*``) are resolved per-span as a
-    union of the live ``current_trace_context`` (set anywhere via
+    union of the live ``current_trace_context`` (mutated anywhere via
     ``update_current_trace(...)``) and the ``ConfidentInstrumentationSettings``
-    defaults — context wins, settings fall back. The same applies to
-    agent / LLM ``metric_collection`` via ``current_agent_context`` /
-    ``current_llm_context``.
+    trace defaults (``name``, ``thread_id``, ``user_id``, ``tags``,
+    ``metadata``, ``metric_collection``, ``test_case_id``, ``turn_id``)
+    — context wins on any field it touches, settings fall back.
 
-    Span-level attrs (``confident.span.*``) are populated from a per-OTel-span
-    ``BaseSpan`` placeholder pushed onto ``current_span_context`` for the span's
-    lifetime. This is what makes ``update_current_span(metadata=..., name=...,
-    input=..., output=..., metric_collection=..., ...)`` work from anywhere in
-    the call stack — including from inside ``@agent.tool_plain`` functions —
-    just like Langfuse's SDK. At ``on_end`` the placeholder's mutated fields
-    are serialized back into ``confident.span.*`` OTel attributes so the
+    Span-level attrs (``confident.span.*``) are populated EXCLUSIVELY from
+    a per-OTel-span ``BaseSpan`` placeholder pushed onto
+    ``current_span_context`` for the span's lifetime. This is what makes
+    ``update_current_span(metadata=..., name=..., input=..., output=...,
+    metric_collection=..., ...)`` work from anywhere in the call stack —
+    including from inside ``@agent.tool_plain`` functions — just like
+    Langfuse's SDK. At ``on_end`` the placeholder's mutated fields are
+    serialized back into ``confident.span.*`` OTel attributes so the
     exporter (REST or OTLP) picks them up.
+    ``ConfidentInstrumentationSettings`` carries no span-level fields by
+    design — span configuration is a runtime concern.
     """
 
     LLM_OPERATION_NAMES = {"chat", "generate_content", "text_completion"}
@@ -226,6 +239,12 @@ class SpanInterceptor(SpanProcessor):
         # within a process so this is safe across threads / asyncio tasks.
         self._tokens: Dict[int, contextvars.Token] = {}
         self._placeholders: Dict[int, BaseSpan] = {}
+        # Per-OTel-root-span state for the implicit trace placeholder we
+        # push when there's no enclosing ``@observe`` / ``with trace(...)``
+        # context. Keyed by the root span's ``span_id`` so we know to clean
+        # up when that exact span ends.
+        self._trace_tokens: Dict[int, contextvars.Token] = {}
+        self._trace_placeholders: Dict[int, Trace] = {}
 
     def on_start(self, span, parent_context):
         # NOTE: we deliberately do NOT mutate ``trace_ctx.uuid`` to match the
@@ -242,40 +261,27 @@ class SpanInterceptor(SpanProcessor):
         # See ``_serialize_trace_context_to_otel_attrs`` and
         # ``_serialize_placeholder_to_otel_attrs``.
 
-        # ----- on_start writes only the things that won't change later -----
-        # ``confident_prompt`` is bound at ``ConfidentInstrumentationSettings``
-        # construction time and is span-level metadata, so it's safe to set
-        # here while the span is still mutable (and avoids one more pass at
-        # on_end through the post-end attr writer).
-        if self.settings.confident_prompt:
-            span.set_attribute(
-                "confident.span.prompt_alias",
-                self.settings.confident_prompt.alias,
-            )
-            span.set_attribute(
-                "confident.span.prompt_commit_hash",
-                self.settings.confident_prompt.hash,
-            )
-            if self.settings.confident_prompt.version:
-                span.set_attribute(
-                    "confident.span.prompt_label",
-                    self.settings.confident_prompt.label,
-                )
-                span.set_attribute(
-                    "confident.span.prompt_version",
-                    self.settings.confident_prompt.version,
-                )
+        # ----- push implicit trace context for bare agent.run callers -----
+        # If the caller didn't wrap in ``@observe`` / ``with trace(...)`` and
+        # this is the OTel root span, push an implicit ``Trace`` placeholder
+        # onto ``current_trace_context`` so ``update_current_trace(...)``
+        # from inside tools / nested helpers actually mutates something.
+        # The placeholder is tagged ``is_otel_implicit=True`` so that
+        # ``ContextAwareSpanProcessor`` keeps routing to OTLP (caller didn't
+        # opt into REST). Mutations are picked up automatically by the
+        # existing per-span ``_serialize_trace_context_to_otel_attrs`` since
+        # it reads from ``current_trace_context`` at every ``on_end``.
+        self._maybe_push_implicit_trace_context(span)
 
-        # ----- per-span classification + per-span metric_collection -----
-        # Span classification (agent / llm / tool) needs to happen at
-        # on_start because ``_push_span_context`` reads the assigned
-        # ``confident.span.type`` to decide whether to create an ``AgentSpan``
-        # vs a ``BaseSpan`` placeholder. The metric_collection lookups read
-        # ``current_agent_context`` / ``current_llm_context`` here as well so
-        # the placeholder carries the right metric_collection from the
-        # outset (the user can still override it via update_current_span).
-        agent_ctx = current_agent_context.get()
-        llm_ctx = current_llm_context.get()
+        # ----- per-span classification (no settings dependency) -----
+        # Span classification (agent / llm / tool) happens at on_start
+        # because ``_push_span_context`` reads the assigned
+        # ``confident.span.type`` to decide whether to create an
+        # ``AgentSpan`` vs a ``BaseSpan`` placeholder. All per-span
+        # configuration (metric_collection, metadata, prompt, etc.) is
+        # the user's responsibility via ``update_current_span(...)``
+        # from inside their tool / agent body — settings deliberately
+        # carries no span-level fields.
         operation_name = span.attributes.get("gen_ai.operation.name")
         agent_name = (
             span.attributes.get("gen_ai.agent.name")
@@ -284,32 +290,13 @@ class SpanInterceptor(SpanProcessor):
         )
 
         if agent_name and self._is_agent_span(operation_name):
-            self._add_agent_span(span, agent_name, agent_ctx)
+            self._add_agent_span(span, agent_name)
 
         if operation_name in self.LLM_OPERATION_NAMES:
-            # Explicitly classify model request spans as LLM spans so they are
-            # not mislabeled as agent spans when gen_ai.agent.name is present.
+            # Explicitly classify model request spans as LLM spans so
+            # they're not mislabeled as agent spans when
+            # gen_ai.agent.name is present.
             span.set_attribute("confident.span.type", "llm")
-            _llm_metric_collection = (
-                (llm_ctx.metric_collection if llm_ctx else None)
-                or self.settings.llm_metric_collection
-            )
-            if _llm_metric_collection:
-                span.set_attribute(
-                    "confident.span.metric_collection",
-                    _llm_metric_collection,
-                )
-
-        tool_name = span.attributes.get("gen_ai.tool.name")
-        if tool_name:
-            tool_metric_collection = (
-                self.settings.tool_metric_collection_map.get(tool_name)
-            )
-            if tool_metric_collection:
-                span.set_attribute(
-                    "confident.span.metric_collection",
-                    str(tool_metric_collection),
-                )
 
         # ----- push BaseSpan placeholder so update_current_span works -----
         self._push_span_context(span, agent_name, operation_name)
@@ -369,6 +356,14 @@ class SpanInterceptor(SpanProcessor):
             if agent_name and self._is_agent_span(operation_name):
                 self._add_agent_span(span, agent_name)
 
+        # ----- pop the implicit trace placeholder if we pushed one -----
+        # Must run AFTER the trace-context serialization above so that the
+        # implicit placeholder's mutations land on this root span's attrs.
+        # Only the root span pushed, so only the root span pops; child
+        # spans see the placeholder via inherited contextvars but never
+        # touch the token.
+        self._maybe_pop_implicit_trace_context(span)
+
     def _push_span_context(
         self,
         span,
@@ -408,12 +403,93 @@ class SpanInterceptor(SpanProcessor):
                 )
             else:
                 placeholder = BaseSpan(**kwargs)
+
+            # Consume any ``next_*_span(...)`` defaults the user staged
+            # for this span. ``pop_pending_for`` returns a one-shot
+            # merged dict (base slot + typed slot for ``span_type``) and
+            # resets both slots so subsequent spans in the same scope
+            # don't re-inherit. ``apply_pending_to_span`` writes the
+            # fields onto the placeholder before we push it onto
+            # ``current_span_context`` so that any user code that
+            # reads the span (or runs ``update_current_span(...)`` later)
+            # sees the staged values as the baseline.
+            pending = pop_pending_for(span_type)
+            if pending:
+                apply_pending_to_span(placeholder, pending)
+
             token = current_span_context.set(placeholder)
             self._tokens[sid] = token
             self._placeholders[sid] = placeholder
         except Exception as exc:
             logger.debug(
                 "Failed to push current_span_context placeholder: %s", exc
+            )
+
+    def _maybe_push_implicit_trace_context(self, span) -> None:
+        """Push an implicit ``Trace`` placeholder for bare ``agent.run`` callers.
+
+        Symmetric to ``_push_span_context``, but at the trace level. Only
+        fires for the OTel root span AND only when the caller hasn't
+        already pushed their own trace context (via ``@observe`` / ``with
+        trace(...)``). The placeholder exists solely so that
+        ``update_current_trace(...)`` from inside tools / nested helpers
+        has a target to mutate; mutations are picked up automatically by
+        the existing per-span ``_serialize_trace_context_to_otel_attrs``.
+
+        Tagged ``is_otel_implicit=True`` so ``ContextAwareSpanProcessor``
+        knows NOT to switch routing to REST — bare callers expect OTLP.
+        """
+        if current_trace_context.get() is not None:
+            return  # user already owns the trace context; don't touch it
+        # Only the OTel root span pushes; child spans inherit the placeholder
+        # via contextvars and never need their own.
+        if getattr(span, "parent", None) is not None:
+            return
+        try:
+            sid = span.get_span_context().span_id
+            tid = span.get_span_context().trace_id
+            start_time = (
+                peb.epoch_nanos_to_perf_seconds(span.start_time)
+                if span.start_time
+                else perf_counter()
+            )
+            implicit = Trace(
+                uuid=to_hex_string(tid, 32),
+                root_spans=[],
+                status=TraceSpanStatus.IN_PROGRESS,
+                start_time=start_time,
+                is_otel_implicit=True,
+            )
+            token = current_trace_context.set(implicit)
+            self._trace_tokens[sid] = token
+            self._trace_placeholders[sid] = implicit
+        except Exception as exc:
+            logger.debug(
+                "Failed to push implicit current_trace_context: %s", exc
+            )
+
+    def _maybe_pop_implicit_trace_context(self, span) -> None:
+        """Pop the implicit trace placeholder pushed at ``on_start``.
+
+        No-op for spans that didn't push (children, or roots that found a
+        user-owned context already in place).
+        """
+        try:
+            sid = span.get_span_context().span_id
+        except Exception:
+            return
+        token = self._trace_tokens.pop(sid, None)
+        self._trace_placeholders.pop(sid, None)
+        if token is None:
+            return
+        try:
+            current_trace_context.reset(token)
+        except Exception as exc:
+            logger.debug(
+                "Failed to reset implicit current_trace_context for "
+                "span_id=%s: %s",
+                sid,
+                exc,
             )
 
     @staticmethod
@@ -454,9 +530,7 @@ class SpanInterceptor(SpanProcessor):
         try:
             span.set_attribute(key, value)
         except Exception as exc:
-            logger.debug(
-                "set_attribute fallback failed for %s: %s", key, exc
-            )
+            logger.debug("set_attribute fallback failed for %s: %s", key, exc)
 
     @classmethod
     def _serialize_placeholder_to_otel_attrs(
@@ -511,9 +585,7 @@ class SpanInterceptor(SpanProcessor):
                 "confident.span.expected_output",
                 placeholder.expected_output,
             )
-        if placeholder.name and not span.attributes.get(
-            "confident.span.name"
-        ):
+        if placeholder.name and not span.attributes.get("confident.span.name"):
             cls._set_attr_post_end(
                 span, "confident.span.name", placeholder.name
             )
@@ -523,8 +595,11 @@ class SpanInterceptor(SpanProcessor):
 
         Reads from ``current_trace_context`` (so ``update_current_trace(...)``
         from anywhere in the call stack lands on every OTel span) with
-        ``ConfidentInstrumentationSettings`` defaults as fallback. Metadata
-        merges settings as base + runtime context on top.
+        ``ConfidentInstrumentationSettings`` trace defaults (``name``,
+        ``thread_id``, ``user_id``, ``tags``, ``metadata``,
+        ``metric_collection``, ``test_case_id``, ``turn_id``) as
+        fallback. Metadata merges settings as base + runtime context on
+        top.
 
         Called at ``on_end`` (not ``on_start``) so the latest values are
         captured rather than a stale snapshot. Goes through
@@ -548,10 +623,8 @@ class SpanInterceptor(SpanProcessor):
             trace_ctx.turn_id if trace_ctx else None
         ) or self.settings.turn_id
         _trace_metric_collection = (
-            (trace_ctx.metric_collection if trace_ctx else None)
-            or self.settings.trace_metric_collection
-            or self.settings.metric_collection
-        )
+            trace_ctx.metric_collection if trace_ctx else None
+        ) or self.settings.metric_collection
         _metadata = {
             **(self.settings.metadata or {}),
             **((trace_ctx.metadata or {}) if trace_ctx else {}),
@@ -564,9 +637,7 @@ class SpanInterceptor(SpanProcessor):
                 span, "confident.trace.thread_id", _thread_id
             )
         if _user_id:
-            self._set_attr_post_end(
-                span, "confident.trace.user_id", _user_id
-            )
+            self._set_attr_post_end(span, "confident.trace.user_id", _user_id)
         if _tags:
             self._set_attr_post_end(span, "confident.trace.tags", _tags)
         if _metadata:
@@ -584,9 +655,7 @@ class SpanInterceptor(SpanProcessor):
                 span, "confident.trace.test_case_id", _test_case_id
             )
         if _turn_id:
-            self._set_attr_post_end(
-                span, "confident.trace.turn_id", _turn_id
-            )
+            self._set_attr_post_end(span, "confident.trace.turn_id", _turn_id)
         if self.settings.environment:
             self._set_attr_post_end(
                 span,
@@ -594,7 +663,7 @@ class SpanInterceptor(SpanProcessor):
                 self.settings.environment,
             )
 
-    def _add_agent_span(self, span, name, agent_ctx=None):
+    def _add_agent_span(self, span, name):
         # Uses the post-end-safe writer because this is called from BOTH
         # ``on_start`` (where set_attribute would also work) and ``on_end``
         # (where it wouldn't, since the SDK has already set ``_end_time``).
@@ -602,16 +671,6 @@ class SpanInterceptor(SpanProcessor):
         # ``_attributes`` mapping in either case.
         self._set_attr_post_end(span, "confident.span.type", "agent")
         self._set_attr_post_end(span, "confident.span.name", name)
-        _agent_metric_collection = (
-            (agent_ctx.metric_collection if agent_ctx else None)
-            or self.settings.agent_metric_collection
-        )
-        if _agent_metric_collection:
-            self._set_attr_post_end(
-                span,
-                "confident.span.metric_collection",
-                _agent_metric_collection,
-            )
 
     def _is_agent_span(self, operation_name: Optional[str]) -> bool:
         return operation_name == "invoke_agent"
