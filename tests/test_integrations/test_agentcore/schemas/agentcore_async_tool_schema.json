@@ -1,38 +1,12 @@
 {
-  "uuid": "1c829e3172aaa21eba134af3324dcaaa",
+  "uuid": "2df2df56cd441775066942c50e99afdc",
   "baseSpans": [],
-  "agentSpans": [
-    {
-      "uuid": "a77cd5e504685bbf",
-      "name": "invoke_agent Strands Agents",
-      "status": "SUCCESS",
-      "type": "agent",
-      "startTime": "2026-03-09T11:17:28.508Z",
-      "endTime": "2026-03-09T11:17:30.630Z",
-      "input": "You are a calculator assistant. Use the calculate tool for math operations. Be concise. What is 9 multiplied by 6?",
-      "output": "<thinking>The 'calculate' tool has returned the result of 9 multiplied by 6.</thinking>\nThe result of 9 multiplied by 6 is 54.\n",
-      "availableTools": [],
-      "agentHandoffs": []
-    },
-    {
-      "uuid": "a77cd5e504685bbf",
-      "name": "",
-      "status": "SUCCESS",
-      "type": "agent",
-      "startTime": "2026-03-09T11:17:28.508Z",
-      "endTime": "2026-03-09T11:17:30.630Z",
-      "input": "You are a calculator assistant. Use the calculate tool for math operations. Be concise. What is 9 multiplied by 6?",
-      "output": "<thinking>The 'calculate' tool has returned the result of 9 multiplied by 6.</thinking>\nThe result of 9 multiplied by 6 is 54.\n",
-      "toolsCalled": [],
-      "availableTools": [],
-      "agentHandoffs": []
-    }
-  ],
+  "agentSpans": [],
   "llmSpans": [],
   "retrieverSpans": [],
   "toolSpans": [],
-  "startTime": "2026-03-09T11:17:28.508Z",
-  "endTime": "2026-03-09T11:17:30.630Z",
+  "startTime": "2026-05-05T17:42:56.245Z",
+  "endTime": "2026-05-05T17:42:56.245Z",
   "name": "agentcore-async-tool-test",
   "metadata": {
     "test_type": "async_tool"
@@ -46,6 +20,7 @@
   "threadId": "async-tool-123",
   "userId": "test-user-async",
   "input": "You are a calculator assistant. Use the calculate tool for math operations. Be concise. What is 9 multiplied by 6?",
-  "output": "<thinking>The 'calculate' tool has returned the result of 9 multiplied by 6.</thinking>\nThe result of 9 multiplied by 6 is 54.\n",
-  "status": "SUCCESS"
+  "output": "The result of 9 multiplied by 6 is 54.\n",
+  "status": "SUCCESS",
+  "metricCollection": "trace_metrics_override_v1"
 }
