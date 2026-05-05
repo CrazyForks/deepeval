@@ -1,40 +1,16 @@
 """AgentCore × deepeval OTel SpanInterceptor.
 
-Translates spans emitted by AWS Bedrock AgentCore / Strands (and any
-OpenLLMetry-traceloop instrumented framework that flows through the
-same TracerProvider) into ``confident.*`` OTel attributes that
-``ConfidentSpanExporter`` rebuilds into deepeval ``BaseSpan``s.
-
-Mirrors the Pydantic AI POC pattern (see
-``deepeval/integrations/pydantic_ai/instrumentator.py``):
-
-  - ``current_span_context`` is populated with a ``BaseSpan`` placeholder
-    for the OTel span's lifetime, so ``update_current_span(...)`` from
-    inside a Strands ``@tool`` body lands on that span. At ``on_end``
-    the placeholder's mutated fields are serialized back into
-    ``confident.span.*`` OTel attributes.
-  - ``current_trace_context`` is populated with an implicit ``Trace``
-    placeholder for bare callers (no enclosing ``@observe`` /
-    ``with trace(...)``) so ``update_current_trace(...)`` from inside a
-    tool body has somewhere to write. The placeholder is tagged
-    ``is_otel_implicit=True`` so ``ContextAwareSpanProcessor`` keeps
-    routing to OTLP for those callers.
-  - ``next_*_span(...)`` payloads are consumed at ``on_start`` via
-    ``pop_pending_for(span_type)`` + ``apply_pending_to_span(...)`` so
-    ``with next_agent_span(metric_collection=..., metrics=[...]):``
-    around an AgentCore invoke lands on the agent span.
-  - Trace-level attrs are resolved FRESH at ``on_end`` from
-    ``current_trace_context`` (mutations during the run are seen) with
-    settings as fallback.
-  - ``BaseMetric`` instances staged via ``next_*_span(metrics=[...])``
-    are stashed via ``stash_pending_metrics`` so the exporter can
-    re-attach them after rebuilding the span (gated on
-    ``trace_manager.is_evaluating`` to keep the registry tight).
+Translates AWS Bedrock AgentCore / Strands / Traceloop spans into
+``confident.*`` OTel attrs that ``ConfidentSpanExporter`` rebuilds into
+deepeval ``BaseSpan``s. Mirrors the Pydantic AI POC pattern: pushes
+``BaseSpan`` placeholders for ``update_current_span(...)``, an implicit
+``Trace(is_otel_implicit=True)`` for bare callers, consumes
+``next_*_span(...)`` payloads at on_start, resolves trace attrs FRESH
+at on_end, and stashes ``BaseMetric`` instances when evaluating.
 
 Framework-specific extraction (Strands ``gen_ai.*`` events, Traceloop
-attributes, AWS Bedrock body parsing) stays in this module — those
-fields capture data the framework writes, not values the user mutates,
-so they don't go through the placeholder serializer.
+attrs, AWS Bedrock body parsing) is framework-written and bypasses the
+placeholder serializer.
 """
 
 from __future__ import annotations
@@ -120,17 +96,10 @@ else:
 init_clock_bridge()
 
 
-# ---------------------------------------------------------------------------
-# Span classification — kept from the prior implementation. AgentCore +
-# Strands emit a mix of ``gen_ai.*`` (OTel GenAI semconv), Traceloop /
-# OpenLLMetry attrs, and span-name heuristics. None of this depends on
-# settings; it inspects the raw OTel span only.
-# ---------------------------------------------------------------------------
-
+# Span classification: ``gen_ai.*`` (OTel GenAI semconv), Traceloop attrs,
+# and span-name heuristics. Settings-independent; inspects raw OTel span only.
 
 _AGENT_OP_NAMES = {"invoke_agent", "create_agent"}
-
-# gen_ai.operation.name values that indicate an LLM-call span
 _LLM_OP_NAMES = {
     "chat",
     "generate_content",
@@ -138,11 +107,8 @@ _LLM_OP_NAMES = {
     "text_completion",
     "embeddings",
 }
-
-# gen_ai.operation.name values that indicate a tool span
 _TOOL_OP_NAMES = {"execute_tool"}
 
-# traceloop.span.kind values → confident span type
 _TRACELOOP_KIND_MAP = {
     "workflow": "agent",
     "agent": "agent",
@@ -166,7 +132,6 @@ def _classify_span(span) -> Optional[str]:
     attrs = span.attributes or {}
     span_name_lower = (span.name or "").lower()
 
-    # 1. Explicit gen_ai.operation.name (Strands + generic OTel GenAI)
     op_name = attrs.get("gen_ai.operation.name", "")
     if op_name in _AGENT_OP_NAMES:
         return "agent"
@@ -175,18 +140,15 @@ def _classify_span(span) -> Optional[str]:
     if op_name in _TOOL_OP_NAMES:
         return "tool"
 
-    # 2. OpenLLMetry / traceloop conventions (LangChain, LangGraph, CrewAI)
     traceloop_kind = attrs.get("traceloop.span.kind", "")
     if traceloop_kind in _TRACELOOP_KIND_MAP:
         return _TRACELOOP_KIND_MAP[traceloop_kind]
 
-    # 3. Presence of canonical tool/agent attributes
     if attrs.get("gen_ai.tool.name") or attrs.get("gen_ai.tool.call.id"):
         return "tool"
     if attrs.get("gen_ai.agent.name") or attrs.get("gen_ai.agent.id"):
         return "agent"
 
-    # 4. Heuristic span-name matching (last resort)
     if any(kw in span_name_lower for kw in ("invoke_agent", "agent")):
         return "agent"
     if any(kw in span_name_lower for kw in ("execute_tool", ".tool")):
@@ -203,7 +165,6 @@ def _classify_span(span) -> Optional[str]:
 
 
 def _get_agent_name(span) -> Optional[str]:
-    """Extract the most descriptive agent name available."""
     return (
         _get_attr(
             span,
@@ -217,27 +178,15 @@ def _get_agent_name(span) -> Optional[str]:
 
 
 def _get_tool_name(span) -> Optional[str]:
-    """Extract the tool name from a tool span."""
     return (
-        _get_attr(
-            span,
-            "gen_ai.tool.name",
-            "traceloop.entity.name",
-        )
+        _get_attr(span, "gen_ai.tool.name", "traceloop.entity.name")
         or span.name
         or None
     )
 
 
-# ---------------------------------------------------------------------------
-# Content / I/O extraction helpers.
-#
-# These walk Strands-style ``gen_ai.*`` events and Traceloop-style
-# attributes to pull out user-facing input/output text and tool calls.
-# They produce data we want surfaced as ``confident.span.*`` /
-# ``confident.trace.*`` attrs at on_end — capturing what the FRAMEWORK
-# wrote, distinct from what the user mutated via update_current_span.
-# ---------------------------------------------------------------------------
+# Content / I/O extraction. Walks ``gen_ai.*`` events and Traceloop attrs to
+# pull framework-written input/output text and tool calls.
 
 
 def _parse_genai_content(raw: Any) -> Optional[str]:
@@ -263,7 +212,7 @@ def _extract_messages(span) -> tuple[Optional[str], Optional[str]]:
     input_text: Optional[str] = None
     output_text: Optional[str] = None
 
-    # 1. Extract from Events (Strands / strict OTel GenAI)
+    # Events (Strands / strict OTel GenAI)
     for event in getattr(span, "events", []):
         event_name = event.name or ""
         event_attrs = event.attributes or {}
@@ -309,7 +258,7 @@ def _extract_messages(span) -> tuple[Optional[str], Optional[str]]:
                 except Exception:
                     pass
 
-    # 2. Fall back to attributes (LangChain, CrewAI, Traceloop)
+    # Fallback: attributes (LangChain / CrewAI / Traceloop)
     if not input_text:
         raw = _get_attr(
             span,
@@ -339,7 +288,7 @@ def _extract_messages(span) -> tuple[Optional[str], Optional[str]]:
 def _extract_tool_calls(span) -> List[ToolCall]:
     tools: List[ToolCall] = []
 
-    # 1. Extract from events (Strands / strict OTel)
+    # Events (Strands / strict OTel)
     for event in getattr(span, "events", []):
         event_attrs = event.attributes or {}
         event_name = event.name or ""
@@ -368,7 +317,7 @@ def _extract_tool_calls(span) -> List[ToolCall]:
             except Exception as exc:
                 logger.debug("Failed to parse tool call event: %s", exc)
 
-    # 2. Extract from attributes (LangChain / CrewAI / Traceloop)
+    # Fallback: attributes (LangChain / CrewAI / Traceloop)
     attrs = span.attributes or {}
 
     tool_calls_raw = (
@@ -386,7 +335,7 @@ def _extract_tool_calls(span) -> List[ToolCall]:
             )
             if isinstance(calls, list):
                 for call in calls:
-                    # Traceloop/OpenLLMetry often nests these under a "function" key
+                    # Traceloop / OpenLLMetry nest these under "function".
                     name = (
                         call.get("name")
                         or call.get("function", {}).get("name")
@@ -431,38 +380,20 @@ def _extract_tool_call_from_tool_span(span) -> Optional[ToolCall]:
     return ToolCall(name=tool_name, input_parameters=input_params)
 
 
-# ---------------------------------------------------------------------------
-# Settings — trace-only kwargs, mirroring DeepEvalInstrumentationSettings.
-#
-# Span-level configuration is intentionally NOT here. Set per-call
-# defaults via ``with next_agent_span(...)`` / ``with next_llm_span(...)``
-# / ``with next_tool_span(...)`` before invoking the agent, or mutate
-# the live placeholder via ``update_current_span(...)`` from inside a
-# Strands ``@tool`` body. See deepeval/integrations/README.md for the
-# full migration table.
-# ---------------------------------------------------------------------------
+# Settings: trace-level kwargs only. Span-level config goes on
+# ``next_*_span(...)`` / ``update_current_span(...)`` — see README.
 
 
 class AgentCoreInstrumentationSettings:
     """Trace-level defaults for AgentCore instrumentation.
 
-    All kwargs are optional. Trace fields are stamped onto every trace
-    produced through ``instrument_agentcore(...)`` (resolved at every
-    span's ``on_end`` so runtime mutations via ``update_current_trace``
-    win).
-
-    A Confident AI ``api_key`` is fully optional. When omitted (and
-    ``CONFIDENT_API_KEY`` isn't in the environment), the OTel pipeline
-    still runs locally but no auth header is attached to the OTLP
-    exporter, so the Confident AI backend rejects the upload. Wire a
-    key when you actually want spans to land in Confident AI.
+    All kwargs are optional. Trace fields are resolved at every span's
+    ``on_end`` so runtime ``update_current_trace(...)`` mutations win.
+    ``api_key`` is optional; when omitted, the OTel pipeline runs
+    locally but the Confident AI backend rejects uploads.
     """
 
-    # All known span-level kwargs that used to live on the top-level
-    # signature. Removed in the migration; raise ``TypeError`` so callers
-    # see exactly what to do. Mirrors
-    # ``test_span_related_kwargs_are_removed_from_settings`` in the
-    # Pydantic AI test suite.
+    # Span-level kwargs removed in the OTel POC migration — raise on use.
     _REMOVED_KWARGS = (
         "is_test_mode",
         "agent_metric_collection",
@@ -489,20 +420,15 @@ class AgentCoreInstrumentationSettings:
     ):
         is_dependency_installed()
 
-        # Reject removed span-level kwargs explicitly so callers get a
-        # crisp error pointing at the migration. We accept ``**removed_kwargs``
-        # only to produce a TypeError with a helpful message; otherwise
-        # Python's default would already raise on unknown kwargs.
+        # ``**removed_kwargs`` exists only to produce a crisp migration error.
         if removed_kwargs:
             offending = ", ".join(sorted(removed_kwargs))
             raise TypeError(
                 f"AgentCoreInstrumentationSettings: unexpected keyword "
                 f"argument(s) {offending}. Span-level kwargs were removed "
-                "in the OTel POC migration. Use ``with next_agent_span(...)`` "
-                "/ ``with next_llm_span(...)`` / ``with next_tool_span(...)`` "
-                "before invoking the agent, or "
-                "``update_current_span(...)`` from inside a Strands @tool "
-                "body. See deepeval/integrations/README.md for details."
+                "in the OTel POC migration; use ``with next_*_span(...)`` "
+                "or ``update_current_span(...)``. "
+                "See deepeval/integrations/README.md."
             )
 
         if trace_manager.environment is not None:
@@ -529,63 +455,28 @@ class AgentCoreInstrumentationSettings:
         self.turn_id = turn_id
 
 
-# ---------------------------------------------------------------------------
-# Span interceptor.
-#
-# Two responsibilities:
-#   1. Push a ``BaseSpan`` placeholder onto ``current_span_context`` for
-#      every OTel span's lifetime. ``update_current_span(...)`` /
-#      ``update_*_span(...)`` calls from inside a Strands ``@tool`` body
-#      mutate this placeholder; at on_end the mutated fields are
-#      serialized back into ``confident.span.*`` OTel attrs.
-#   2. Translate AgentCore / Strands / Traceloop framework-emitted
-#      attributes into ``confident.*`` attrs (input/output text, tool
-#      calls, model name, token counts) — distinct from user mutations.
-#
-# Plus the smaller bridges from the Pydantic AI POC:
-#   - Implicit ``Trace(is_otel_implicit=True)`` push for bare callers so
-#     ``update_current_trace(...)`` from a tool body works.
-#   - ``confident.span.parent_uuid`` stamp for OTel roots inside an
-#     enclosing deepeval span (so ``@observe(type="agent") -> agent(...)``
-#     stitches into a single trace).
-#   - ``next_*_span(...)`` payload consumption + ``stash_pending_metrics``
-#     gate for component-level evals.
-# ---------------------------------------------------------------------------
+# Span interceptor. Pushes BaseSpan placeholders for ``update_current_span``,
+# implicit Trace for bare callers, parent-uuid bridge for OTel roots inside
+# ``@observe``, ``next_*_span`` consumption, and framework-attr extraction.
 
 
 class AgentCoreSpanInterceptor(SpanProcessor):
 
     def __init__(self, settings_instance: AgentCoreInstrumentationSettings):
         self.settings = settings_instance
-        # Per-OTel-span state, keyed by OTel span_id. Two spans never
-        # share an id within a process so this is safe across threads /
-        # asyncio tasks.
+        # Per-OTel-span state keyed by span_id (unique within a process).
         self._tokens: Dict[int, contextvars.Token] = {}
         self._placeholders: Dict[int, BaseSpan] = {}
-        # Per-OTel-root-span state for the implicit trace placeholder we
-        # push when there's no enclosing context.
+        # Implicit-trace state, keyed on the OTel root span_id that pushed it.
         self._trace_tokens: Dict[int, contextvars.Token] = {}
         self._trace_placeholders: Dict[int, Trace] = {}
 
-    # ------------------------------------------------------------------
-    # on_start
-    # ------------------------------------------------------------------
-
     def on_start(self, span, parent_context):
-        # Push implicit Trace for bare callers BEFORE classification, so
-        # the implicit context is in place if anything downstream reads
-        # ``current_trace_context`` (parity with Pydantic AI's order).
+        # Order matches Pydantic AI: implicit-trace push before classification
+        # so anything reading ``current_trace_context`` downstream sees it.
         self._maybe_push_implicit_trace_context(span)
-
-        # Bridge OTel root spans to an enclosing deepeval span (e.g.
-        # ``@observe(type="agent")`` wrapping an agentcore invoke) by
-        # stamping ``confident.span.parent_uuid``. Only fires for OTel
-        # roots; child OTel spans keep their native parent.
         self._maybe_bridge_otel_root_to_deepeval_parent(span)
 
-        # Classify the span using AgentCore's existing heuristics. This
-        # is the source of truth for ``confident.span.type`` and decides
-        # which placeholder subclass we push.
         span_type = _classify_span(span)
         if span_type:
             try:
@@ -593,9 +484,7 @@ class AgentCoreSpanInterceptor(SpanProcessor):
             except Exception:
                 pass
 
-        # Span-type-specific name discovery (kept from the prior
-        # implementation; agent / tool name attrs land at on_start
-        # because the placeholder type depends on them).
+        # Stamp name at on_start because the placeholder subclass depends on it.
         if span_type == "agent":
             agent_name = _get_agent_name(span)
             if agent_name:
@@ -611,19 +500,12 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                 except Exception:
                     pass
 
-        # Push BaseSpan placeholder so ``update_current_span(...)``
-        # from inside a Strands ``@tool`` body lands somewhere.
         self._push_span_context(span, span_type)
-
-    # ------------------------------------------------------------------
-    # on_end
-    # ------------------------------------------------------------------
 
     def on_end(self, span):
         sid = span.get_span_context().span_id
 
-        # Snapshot trace context FRESH at on_end so the latest
-        # ``update_current_trace(...)`` values land on this OTel span.
+        # Resolve trace attrs FRESH so live ``update_current_trace(...)`` wins.
         try:
             self._serialize_trace_context_to_otel_attrs(span)
         except Exception as exc:
@@ -633,8 +515,6 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                 exc,
             )
 
-        # Pop placeholder + reset contextvar token; serialize user-mutated
-        # fields onto ``confident.span.*`` attrs.
         placeholder = self._placeholders.pop(sid, None)
         token = self._tokens.pop(sid, None)
         if token is not None:
@@ -667,11 +547,8 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                     exc,
                 )
 
-        # Framework extraction: write Strands / Traceloop / GenAI attrs
-        # onto ``confident.*`` so the exporter rebuilds richer spans.
-        # These are FRAMEWORK fields (events written by the agent loop),
-        # not user-mutable, so they live alongside the placeholder
-        # serialization rather than inside it.
+        # Framework attrs are non-user-mutable; written alongside (not inside)
+        # the placeholder serializer.
         try:
             self._serialize_framework_attrs(span)
         except Exception as exc:
@@ -681,22 +558,15 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                 exc,
             )
 
-        # Pop implicit Trace placeholder if we pushed one for this span.
-        # MUST run after trace-context serialization above so the
-        # implicit placeholder's mutations land on this root's attrs.
+        # Must run AFTER trace serialization so the implicit placeholder's
+        # mutations land on this root's attrs.
         self._maybe_pop_implicit_trace_context(span)
 
-    # ------------------------------------------------------------------
-    # Placeholder push / pop on current_span_context
-    # ------------------------------------------------------------------
-
     def _push_span_context(self, span, span_type: Optional[str]) -> None:
-        """Create a placeholder ``BaseSpan`` (or ``AgentSpan``) and push.
+        """Push a ``BaseSpan`` / ``AgentSpan`` placeholder onto the contextvar.
 
-        Mirrors ``deepeval.integrations.pydantic_ai.SpanInterceptor._push_span_context``.
-        Consumes any ``next_*_span(...)`` defaults via ``pop_pending_for``
-        + ``apply_pending_to_span`` BEFORE the push so the placeholder
-        the user code sees has the staged values.
+        Consumes ``next_*_span(...)`` defaults BEFORE the push so user code
+        sees the staged values.
         """
         try:
             sid = span.get_span_context().span_id
@@ -713,9 +583,7 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                 start_time=start_time,
             )
             if span_type == "agent":
-                # Pull the on_start-stamped name (set above from
-                # _get_agent_name) so the placeholder's name matches the
-                # OTel attr — saves a duplicate lookup.
+                # Reuse the on_start-stamped name to skip a duplicate lookup.
                 attrs = span.attributes or {}
                 placeholder = AgentSpan(
                     name=(
@@ -741,12 +609,10 @@ class AgentCoreSpanInterceptor(SpanProcessor):
             )
 
     def _maybe_push_implicit_trace_context(self, span) -> None:
-        """Push an implicit ``Trace`` placeholder for bare callers.
+        """Push an implicit ``Trace`` for OTel roots without enclosing context.
 
-        Symmetric to ``_push_span_context`` but at the trace level.
-        Only fires for OTel root spans AND only when no caller-pushed
-        trace context is active. Tagged ``is_otel_implicit=True`` so
-        ``ContextAwareSpanProcessor`` keeps routing to OTLP.
+        Tagged ``is_otel_implicit=True`` so ``ContextAwareSpanProcessor``
+        still routes to OTLP.
         """
         if current_trace_context.get() is not None:
             return
@@ -776,14 +642,11 @@ class AgentCoreSpanInterceptor(SpanProcessor):
             )
 
     def _maybe_bridge_otel_root_to_deepeval_parent(self, span) -> None:
-        """Re-parent OTel roots onto an enclosing deepeval span.
+        """Re-parent OTel roots onto an enclosing ``@observe`` deepeval span.
 
-        When ``@observe(type="agent")`` wraps an agentcore invoke, the
-        deepeval span lives in ``current_span_context`` but isn't an
-        OTel span — so the framework's OTel root has no native parent.
-        Stamping ``confident.span.parent_uuid`` lets the exporter
-        re-parent the OTel root onto the deepeval span, producing a
-        single trace tree instead of two siblings.
+        Stamps ``confident.span.parent_uuid`` so the exporter stitches the
+        OTel root into the deepeval parent's trace instead of leaving them
+        as siblings.
         """
         if getattr(span, "parent", None) is not None:
             return
@@ -824,20 +687,13 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                 exc,
             )
 
-    # ------------------------------------------------------------------
-    # Attribute writers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _set_attr_post_end(span, key: str, value: Any) -> None:
-        """Write an attribute onto a span that may already have ended.
+        """Write to a span that may have ended.
 
-        ``Span.set_attribute`` becomes a silent no-op once
-        ``Span.end()`` has been called. Mirrors the Pydantic AI POC
-        helper of the same name — writes directly through the
-        underlying ``BoundedAttributes`` mapping (which is
-        ``immutable=False`` while the span is being processed) so
-        downstream processors / exporters see the value.
+        ``Span.set_attribute`` is a no-op after ``Span.end()``, so we write
+        directly through ``_attributes`` (mutable while processors are
+        running) and fall back to ``set_attribute`` if that fails.
         """
         try:
             attrs = getattr(span, "_attributes", None)
@@ -860,12 +716,9 @@ class AgentCoreSpanInterceptor(SpanProcessor):
     def _serialize_placeholder_to_otel_attrs(
         cls, placeholder: BaseSpan, span
     ) -> None:
-        """Mirror update_current_span writes onto confident.span.* attrs.
+        """Mirror ``update_current_span`` writes onto ``confident.span.*``.
 
-        Only writes attrs the user actively set on the placeholder.
-        Existing attrs already populated by ``on_start`` (e.g.
-        ``confident.span.name`` from the discovered agent name) are not
-        overwritten by empty placeholder fields.
+        Only writes user-set fields; doesn't overwrite on_start-stamped attrs.
         """
         existing = span.attributes or {}
 
@@ -917,12 +770,12 @@ class AgentCoreSpanInterceptor(SpanProcessor):
             )
 
     def _serialize_trace_context_to_otel_attrs(self, span) -> None:
-        """Resolve trace-level attrs FRESH and write to ``confident.trace.*``.
+        """Resolve trace attrs FRESH and write to ``confident.trace.*``.
 
-        Reads ``current_trace_context.get()`` (so
-        ``update_current_trace(...)`` mutations land on every OTel
-        span's attrs) with ``self.settings.*`` as fallback. Metadata
-        merges settings as base + runtime context on top.
+        Reads ``current_trace_context.get()`` (so live
+        ``update_current_trace(...)`` mutations win) with
+        ``self.settings.*`` as fallback. Metadata is settings-base merged
+        with runtime context on top.
         """
         trace_ctx = current_trace_context.get()
 
@@ -981,9 +834,7 @@ class AgentCoreSpanInterceptor(SpanProcessor):
                 self.settings.environment,
             )
 
-        # Mirror inputs/outputs onto the trace if Strands wrote them on
-        # the agent root span (existing behavior — derived from
-        # framework attrs, not user mutation).
+        # Default thread_id from Strands' ``session.id`` if nothing else set it.
         if not (span.attributes or {}).get("confident.trace.thread_id"):
             session_id = (span.attributes or {}).get("session.id")
             if session_id:
@@ -994,12 +845,8 @@ class AgentCoreSpanInterceptor(SpanProcessor):
     def _serialize_framework_attrs(self, span) -> None:
         """Translate Strands / Traceloop / GenAI attrs into ``confident.*``.
 
-        These fields are written by the framework (events on the OTel
-        span, raw attrs from the underlying SDK), not by user code, so
-        they don't go through the placeholder serializer. We still
-        prefer the placeholder's value if the user mutated it via
-        ``update_current_span(...)`` — the placeholder serializer
-        already wrote those, so we use ``setdefault`` semantics here.
+        Uses ``setdefault`` semantics — the placeholder serializer ran first,
+        so user mutations win.
         """
         attrs = span.attributes or {}
         span_type = attrs.get("confident.span.type") or _classify_span(span)

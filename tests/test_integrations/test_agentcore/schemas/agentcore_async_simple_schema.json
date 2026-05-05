@@ -1,12 +1,51 @@
 {
-  "uuid": "ee4d8b6c3b930d3ea8b48310b92024c5",
-  "baseSpans": [],
-  "agentSpans": [],
-  "llmSpans": [],
+  "uuid": "2e70cddbaef17a9b59b7183c9f65e308",
+  "baseSpans": [
+    {
+      "uuid": "da365cb9d7120946",
+      "name": "execute_event_loop_cycle",
+      "status": "SUCCESS",
+      "type": "base",
+      "parentUuid": "11e7efc1cad52539",
+      "startTime": "2026-05-05T18:12:25.875Z",
+      "endTime": "2026-05-05T18:12:27.911Z",
+      "input": "Be concise, reply with one short sentence only. Say hello in exactly three words."
+    }
+  ],
+  "agentSpans": [
+    {
+      "uuid": "11e7efc1cad52539",
+      "name": "invoke_agent Strands Agents",
+      "status": "SUCCESS",
+      "type": "agent",
+      "startTime": "2026-05-05T18:12:25.874Z",
+      "endTime": "2026-05-05T18:12:27.912Z",
+      "input": "Be concise, reply with one short sentence only. Say hello in exactly three words.",
+      "output": "Hello, how are you?\n",
+      "availableTools": [],
+      "agentHandoffs": []
+    }
+  ],
+  "llmSpans": [
+    {
+      "uuid": "d278d05b1ece51d0",
+      "name": "chat",
+      "status": "SUCCESS",
+      "type": "llm",
+      "parentUuid": "da365cb9d7120946",
+      "startTime": "2026-05-05T18:12:25.875Z",
+      "endTime": "2026-05-05T18:12:27.910Z",
+      "input": "Be concise, reply with one short sentence only. Say hello in exactly three words.",
+      "output": "Hello, how are you?",
+      "model": "amazon.nova-lite-v1:0",
+      "inputTokenCount": 17.0,
+      "outputTokenCount": 7.0
+    }
+  ],
   "retrieverSpans": [],
   "toolSpans": [],
-  "startTime": "2026-05-05T17:42:52.005Z",
-  "endTime": "2026-05-05T17:42:52.005Z",
+  "startTime": "2026-05-05T18:12:25.874Z",
+  "endTime": "2026-05-05T18:12:27.912Z",
   "name": "agentcore-async-simple-test",
   "metadata": {
     "test_type": "async_simple"
@@ -20,7 +59,6 @@
   "threadId": "async-simple-123",
   "userId": "test-user-async",
   "input": "Be concise, reply with one short sentence only. Say hello in exactly three words.",
-  "output": "Hello, there, friend.\n",
-  "status": "SUCCESS",
-  "metricCollection": "trace_metrics_override_v1"
+  "output": "Hello, how are you?\n",
+  "status": "SUCCESS"
 }
