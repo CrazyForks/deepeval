@@ -20,6 +20,7 @@ from deepeval.tracing.otel.context_aware_processor import (
     ContextAwareSpanProcessor,
 )
 from deepeval.tracing.otel.utils import (
+    stash_pending_metrics,
     to_hex_string,
 )
 from deepeval.tracing.perf_epoch_bridge import init_clock_bridge
@@ -382,6 +383,22 @@ class SpanInterceptor(SpanProcessor):
             except Exception as exc:
                 logger.debug(
                     "Failed to serialize span placeholder for span_id=%s: %s",
+                    sid,
+                    exc,
+                )
+            # ``BaseMetric`` instances can't ride in OTel attrs (primitives
+            # only), so hand them to the in-process overlay for the exporter
+            # to re-attach. Eval-mode gate prevents the registry from growing
+            # in prod paths where the OTLP collector lives in another process
+            # and the reader never fires.
+            try:
+                if placeholder.metrics and trace_manager.is_evaluating:
+                    stash_pending_metrics(
+                        to_hex_string(sid, 16), placeholder.metrics
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to stash pending metrics for span_id=%s: %s",
                     sid,
                     exc,
                 )

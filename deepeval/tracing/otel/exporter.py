@@ -32,6 +32,7 @@ from deepeval.tracing.otel.utils import (
     check_llm_input_from_gen_ai_attributes,
     check_tool_name_from_gen_ai_attributes,
     check_tool_output,
+    pop_pending_metrics,
     set_trace_time,
     to_hex_string,
     parse_string,
@@ -535,6 +536,13 @@ class ConfidentSpanExporter(SpanExporter):
             base_span.input = span_input
         if span_output:
             base_span.output = span_output
+
+        # Re-attach ``BaseMetric`` instances staged via
+        # ``next_*_span(metrics=[...])`` from the in-process overlay
+        # (can't ride in OTel attrs). Pop = self-cleaning.
+        pending_metrics = pop_pending_metrics(base_span.uuid)
+        if pending_metrics:
+            base_span.metrics = pending_metrics
 
     @staticmethod
     def prepare_boilerplate_base_span(span: ReadableSpan) -> Optional[BaseSpan]:

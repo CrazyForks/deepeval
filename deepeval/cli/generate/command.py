@@ -4,8 +4,8 @@ from typing import List, Optional
 import typer
 from rich import print
 
-from deepeval.synthesizer import Synthesizer
-from deepeval.synthesizer.config import ContextConstructionConfig
+# Synthesizer chain (ChromaDB etc.) is deferred to inside generate_command
+# so unrelated CLI commands (e.g. ``deepeval test run``) don't pay for it.
 from deepeval.cli.generate.utils import (
     FileType,
     GenerationMethod,
@@ -186,6 +186,9 @@ def generate_command(
     ),
 ):
     """Generate synthetic goldens with the golden synthesizer."""
+    from deepeval.synthesizer import Synthesizer
+    from deepeval.synthesizer.config import ContextConstructionConfig
+
     document_paths = None
     contexts = None
     goldens = None
