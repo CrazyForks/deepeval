@@ -4,7 +4,8 @@ title: Tracing Multi-Turn Applications
 sidebar_label: Tracing Multi-Turn Systems
 ---
 
-import { ASSETS } from "@site/src/assets";
+
+import { ASSETS } from '@site/src/assets';
 
 **Multi-turn tracing** is the practice of tracking user state, context retention, and conversational drift across multiple interactions over time. Unlike single-turn applications where each request is isolated and independent, conversational agents (like chatbots or support assistants) consist of multiple related turns that must be stitched together to form a complete narrative. By linking individual executions, you can monitor how your application handles long-term memory and behavioral consistency.
 
@@ -201,19 +202,19 @@ agent.invoke(
 </Tab>
 <Tab value="Pydantic AI">
 
-Pass `thread_id` to `DeepEvalInstrumentationSettings` when constructing your agent. Every `run_sync` or `run` call on that agent instance is tagged with the same thread and grouped accordingly.
+Pass `thread_id` to `ConfidentInstrumentationSettings` when constructing your agent. Every `run_sync` or `run` call on that agent instance is tagged with the same thread and grouped accordingly.
 
 ```python title="chatbot.py" showLineNumbers
 from pydantic_ai import Agent
 
-from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
+from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
 
 thread_id = "session-123"
 
 agent = Agent(
     "openai:gpt-4o-mini",
     instructions="You are a helpful customer support assistant.",
-    instrument=DeepEvalInstrumentationSettings(thread_id=thread_id),
+    instrument=ConfidentInstrumentationSettings(thread_id=thread_id),
 )
 
 # Turn 1 — start a new thread
@@ -305,6 +306,7 @@ Confident AI natively handles multi-turn observability through its Thread Explor
 <Step>
 ### Create a multi-turn metric collection
 
+
 Log in to Confident AI and create a metric collection containing your desired multi-turn metrics, such as the `KnowledgeRetentionMetric`, `TurnRelevancyMetric`, or `RoleAdherenceMetric`.
 
 <VideoDisplayer
@@ -316,6 +318,7 @@ Log in to Confident AI and create a metric collection containing your desired mu
 </Step>
 <Step>
 ### Attach the collection to your trace
+
 
 In your application code, reference the metric collection by name in `update_current_trace()`. When each trace is exported, Confident AI identifies the `thread_id`, reconstructs the full thread, and evaluates it against your specified metrics asynchronously.
 
@@ -334,6 +337,7 @@ When the trace is sent to Confident AI, the platform automatically identifies th
 </Step>
 <Step>
 ### Monitor conversational drift
+
 
 Use the Thread Explorer on Confident AI to review the aggregated multi-turn scores. You can replay entire user sessions turn-by-turn to pinpoint exactly where the model drifted off-topic or forgot user constraints.
 
@@ -388,8 +392,7 @@ In this guide, you learned how to stitch individual traces together to monitor t
         "Multi-turn tracing is the practice of grouping per-turn traces into a single conversational thread so you can monitor context retention, role adherence, and topic drift across an entire user session.",
     },
     {
-      question:
-        "What's the difference between a trace and a thread in DeepEval?",
+      question: "What's the difference between a trace and a thread in DeepEval?",
       answer: (
         <>
           A trace is one back-and-forth interaction (one user message and one
@@ -419,9 +422,9 @@ In this guide, you learned how to stitch individual traces together to monitor t
       question: "How do I attach retrieval_context to specific turns?",
       answer: (
         <>
-          Use <code>update_current_span(retrieval_context=...)</code> inside the
-          retriever step of that turn. This makes multi-turn RAG metrics like{" "}
-          <code>TurnFaithfulnessMetric</code> work without extra wiring.
+          Use <code>update_current_span(retrieval_context=...)</code> inside
+          the retriever step of that turn. This makes multi-turn RAG metrics
+          like <code>TurnFaithfulnessMetric</code> work without extra wiring.
         </>
       ),
     },
@@ -429,8 +432,7 @@ In this guide, you learned how to stitch individual traces together to monitor t
       question: "How do I evaluate a complete thread on demand?",
       answer: (
         <>
-          Call{" "}
-          <code>evaluate_thread(thread_id=..., metric_collection=...)</code>{" "}
+          Call <code>evaluate_thread(thread_id=..., metric_collection=...)</code>{" "}
           after the conversation ends.{" "}
           <a href="https://confident-ai.com">Confident AI</a> reconstructs the
           full thread from all traces sharing that ID and runs the metric
