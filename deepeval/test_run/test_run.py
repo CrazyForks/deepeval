@@ -896,8 +896,6 @@ class TestRunManager:
         json_str = json.dumps(body, cls=TestRunEncoder)
         body = json.loads(json_str)
 
-        print(body)
-
         data, link = api.send_request(
             method=HttpMethods.POST,
             endpoint=Endpoints.TEST_RUN_ENDPOINT,
