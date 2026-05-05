@@ -32,6 +32,11 @@ from tests.test_integrations.test_pydanticai.apps.pydanticai_multiple_tools_app 
     create_multiple_tools_agent,
     ainvoke_multiple_tools_agent,
 )
+from tests.test_integrations.test_pydanticai.apps.pydanticai_isolation_app import (
+    concurrent_isolation_run,
+    create_isolation_agent,
+    make_distinct_requests,
+)
 
 # =============================================================================
 # CONFIGURATION
@@ -204,3 +209,67 @@ class TestDeepEvalFeaturesAsync:
         )
 
         assert result is not None
+
+
+# =============================================================================
+# CONCURRENT ISOLATION (behavioral, NO schema)
+# =============================================================================
+
+
+class TestConcurrentIsolation:
+    """Behavioral isolation check across ``asyncio.gather``.
+
+    Mirrors ``pydantic_after_concurrent.py``. **No ``@trace_test``
+    decorator** — ``trace_testing_manager.test_dict`` is a single
+    global slot that would race across the 3 concurrent
+    ``end_trace`` calls, capturing only the (random) last winner.
+    The interesting property here is contextvar isolation in user
+    space, which we can assert without touching the trace capture.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_isolation(self):
+        """Three concurrent ``await agent.run(...)`` calls via
+        ``asyncio.gather``. Each task stamps ``_request_ctx`` with
+        its own ``(user_id, request_id)`` before the call and re-reads
+        it after. The post-run value MUST equal the pre-run value
+        (no cross-task leakage of ``ContextVar`` state, no leakage
+        through deepeval's ``current_trace_context`` /
+        ``current_span_context`` per-task copies).
+        """
+        agent = create_isolation_agent(
+            name="pydanticai-concurrent-isolation-test"
+        )
+        requests = make_distinct_requests()
+
+        results = await concurrent_isolation_run(agent, requests)
+
+        # All three calls returned a result.
+        assert len(results) == len(requests)
+
+        # Per-task contextvar stability: post-run value matches pre-run.
+        # If this fails, ContextVar state leaked across asyncio tasks
+        # (which would be a serious regression — Python guarantees task-
+        # local contextvars via per-task context snapshots).
+        for r in results:
+            assert r["post_run_request_id"] == r["request_id"], (
+                f"Task for request_id={r['request_id']!r} saw "
+                f"post-run value {r['post_run_request_id']!r}. "
+                "ContextVar leak across asyncio tasks."
+            )
+            assert r["post_run_user_id"] == r["user_id"], (
+                f"Task for user_id={r['user_id']!r} saw post-run "
+                f"value {r['post_run_user_id']!r}."
+            )
+
+        # All request_ids and user_ids are distinct across tasks.
+        assert len({r["request_id"] for r in results}) == len(requests)
+        assert len({r["user_id"] for r in results}) == len(requests)
+
+        # Each task's output reflects its own ``key``.
+        for r in results:
+            assert r["expected_key"] in r["output"], (
+                f"Task expected output to reference key "
+                f"{r['expected_key']!r}, got {r['output']!r}. "
+                "Possible cross-task output mix."
+            )

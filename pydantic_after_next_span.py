@@ -49,7 +49,7 @@ from deepeval.tracing import (
     next_agent_span,
     next_llm_span,
 )
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 
 
 # Unique per-script-run id so every trace produced by this run can be
@@ -57,7 +57,7 @@ from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
 RUN_ID = f"{Path(__file__).stem}-{uuid.uuid4().hex[:8]}"
 
 
-settings = ConfidentInstrumentationSettings(
+settings = DeepEvalInstrumentationSettings(
     name="pydantic-ai-next-span-validation",
     tags=["after-rewrite", "next-span"],
     metadata={"run_id": RUN_ID},
@@ -186,7 +186,7 @@ def main() -> None:
 
     print(
         f"\nAll traces from this run share metadata.run_id = '{RUN_ID}' "
-        "(stamped via ConfidentInstrumentationSettings.metadata).\n"
+        "(stamped via DeepEvalInstrumentationSettings.metadata).\n"
         "Open the Confident AI dashboard and filter by that run_id. You "
         "should see SIX traces (1 + 1 + 2 + 2). Per scenario:\n"
         "  - Scenario 1: agent span has metric_collection=scenario-1-agent\n"

@@ -46,6 +46,25 @@ from deepeval.confident.api import set_confident_api_key
 from deepeval.tracing.utils import make_json_serializable_for_metadata
 
 
+def _resolve_parent_uuid(span: ReadableSpan) -> Optional[str]:
+    """Resolve a deepeval ``parent_uuid`` for an exported OTel span.
+
+    Native OTel parenthood always wins: if ``span.parent`` is set, we use it.
+    Only when the span is an OTel root do we look for a
+    ``confident.span.parent_uuid`` attribute, which integrations (currently
+    pydantic-ai's ``SpanInterceptor``) stamp onto OTel roots that started
+    inside a deepeval-managed span (``@observe``, ``with trace(...)``)
+    so the OTel root re-parents onto its logical deepeval parent instead
+    of becoming a second trace root.
+    """
+    if span.parent is not None:
+        return to_hex_string(span.parent.span_id, 16)
+    override = span.attributes.get("confident.span.parent_uuid")
+    if isinstance(override, str) and override:
+        return override
+    return None
+
+
 @dataclass
 class BaseSpanWrapper:
     base_span: BaseSpan
@@ -321,9 +340,7 @@ class ConfidentSpanExporter(SpanExporter):
         except Exception:
             pass
 
-        parent_uuid = (
-            to_hex_string(span.parent.span_id, 16) if span.parent else None
-        )
+        parent_uuid = _resolve_parent_uuid(span)
         base_span_status = TraceSpanStatus.SUCCESS
         base_span_error = None
 
@@ -497,9 +514,7 @@ class ConfidentSpanExporter(SpanExporter):
         span_metric_collection = parse_string(raw_span_metric_collection)
 
         # Set Span Attributes
-        base_span.parent_uuid = (
-            to_hex_string(span.parent.span_id, 16) if span.parent else None
-        )
+        base_span.parent_uuid = _resolve_parent_uuid(span)
         base_span.name = None if base_span.name == "None" else base_span.name
         base_span.name = span_name or base_span.name or span.name
         base_span.status = base_span_status  # setting for boilerplate spans
@@ -538,9 +553,7 @@ class ConfidentSpanExporter(SpanExporter):
         )
         children = []
         trace_uuid = to_hex_string(span.context.trace_id, 32)
-        parent_uuid = (
-            to_hex_string(span.parent.span_id, 16) if span.parent else None
-        )
+        parent_uuid = _resolve_parent_uuid(span)
         start_time = peb.epoch_nanos_to_perf_seconds(span.start_time)
         end_time = peb.epoch_nanos_to_perf_seconds(span.end_time)
 

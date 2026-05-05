@@ -4,7 +4,7 @@ Covers:
   - Trace-level reads from ``current_trace_context`` for ``thread_id``,
     ``name``, ``user_id``, ``tags``, ``metadata``, ``test_case_id``,
     ``turn_id``, and ``metric_collection`` — with
-    ``ConfidentInstrumentationSettings`` trace defaults as fallback when
+    ``DeepEvalInstrumentationSettings`` trace defaults as fallback when
     the runtime context doesn't set them.
   - Span-context push/pop: ``current_span_context`` is set to a
     placeholder ``BaseSpan`` for the OTel span's lifetime so
@@ -79,7 +79,7 @@ def _make_mock_span(operation_name=None, agent_name=None, tool_name=None):
 
 
 def _make_settings(**kwargs):
-    """Return a minimal mock ``ConfidentInstrumentationSettings``.
+    """Return a minimal mock ``DeepEvalInstrumentationSettings``.
 
     Only the attributes ``SpanInterceptor`` actually reads are populated.
     Anything not provided defaults to ``None`` so the
@@ -297,7 +297,7 @@ class TestSpanInterceptorNewTraceContextReads:
 
     def test_trace_metric_collection_falls_back_to_settings(self):
         """Without a runtime ``metric_collection`` set, the
-        ``ConfidentInstrumentationSettings`` default is used — same
+        ``DeepEvalInstrumentationSettings`` default is used — same
         fallback behavior as ``name`` / ``user_id`` / etc."""
         token = current_trace_context.set(None)
         try:
@@ -658,6 +658,110 @@ class TestContextAwareSpanProcessorRouting:
         rest.on_end.assert_called_once_with(span)
         otlp.on_end.assert_not_called()
 
+    def test_routes_to_rest_when_test_name_is_set(self):
+        """Trace-shape testing override: when
+        ``trace_testing_manager.test_name`` is set (i.e. inside an
+        ``@assert_trace_json`` / ``@generate_trace_json`` decorator),
+        spans must flow through the REST path even with no user-pushed
+        trace context and ``is_evaluating=False`` — otherwise the only
+        writer of ``trace_testing_manager.test_dict``
+        (``trace_manager.end_trace``) never fires for bare
+        ``agent.run(...)`` flows, the decorator's
+        ``wait_for_test_dict()`` times out, and ``{} == {}`` makes
+        every schema test trivially pass.
+        """
+        from deepeval.tracing.trace_test_manager import (
+            trace_testing_manager,
+        )
+
+        processor, rest, otlp = self._make_processor()
+        span = _FakeSpan()
+
+        token = current_trace_context.set(None)
+        prev_test_name = trace_testing_manager.test_name
+        try:
+            trace_testing_manager.test_name = "any_name"
+            with patch(
+                "deepeval.tracing.otel.context_aware_processor.trace_manager"
+            ) as fake_tm:
+                fake_tm.is_evaluating = False
+                processor.on_end(span)
+        finally:
+            trace_testing_manager.test_name = prev_test_name
+            current_trace_context.reset(token)
+
+        rest.on_end.assert_called_once_with(span)
+        otlp.on_end.assert_not_called()
+
+    def test_routes_to_rest_when_test_name_set_with_implicit_trace(self):
+        """The actual scenario in ``test_sync.py`` / ``test_async.py``:
+        bare ``agent.run(...)`` (so ``SpanInterceptor`` pushes an implicit
+        ``Trace`` placeholder, which on its own routes to OTLP) PLUS the
+        test harness has set ``trace_testing_manager.test_name``. The
+        test-name override must still flip routing to REST even though
+        the only trace context active is implicit.
+        """
+        from deepeval.tracing.trace_test_manager import (
+            trace_testing_manager,
+        )
+        from deepeval.tracing.types import Trace, TraceSpanStatus
+
+        processor, rest, otlp = self._make_processor()
+        span = _FakeSpan()
+
+        implicit_trace = Trace(
+            uuid="abc",
+            root_spans=[],
+            status=TraceSpanStatus.IN_PROGRESS,
+            start_time=0.0,
+            is_otel_implicit=True,
+        )
+        token = current_trace_context.set(implicit_trace)
+        prev_test_name = trace_testing_manager.test_name
+        try:
+            trace_testing_manager.test_name = "any_name"
+            with patch(
+                "deepeval.tracing.otel.context_aware_processor.trace_manager"
+            ) as fake_tm:
+                fake_tm.is_evaluating = False
+                processor.on_end(span)
+        finally:
+            trace_testing_manager.test_name = prev_test_name
+            current_trace_context.reset(token)
+
+        rest.on_end.assert_called_once_with(span)
+        otlp.on_end.assert_not_called()
+
+    def test_routes_to_otlp_when_test_name_is_none(self):
+        """Negative guard: a freshly-cleared ``test_name`` (the default
+        outside the test decorators) must NOT spuriously route to REST.
+        Pairs with ``test_routes_to_rest_when_test_name_is_set`` so a
+        future bug that flips the predicate (e.g. ``is None`` vs
+        ``is not None``) is caught immediately.
+        """
+        from deepeval.tracing.trace_test_manager import (
+            trace_testing_manager,
+        )
+
+        processor, rest, otlp = self._make_processor()
+        span = _FakeSpan()
+
+        token = current_trace_context.set(None)
+        prev_test_name = trace_testing_manager.test_name
+        try:
+            trace_testing_manager.test_name = None
+            with patch(
+                "deepeval.tracing.otel.context_aware_processor.trace_manager"
+            ) as fake_tm:
+                fake_tm.is_evaluating = False
+                processor.on_end(span)
+        finally:
+            trace_testing_manager.test_name = prev_test_name
+            current_trace_context.reset(token)
+
+        otlp.on_end.assert_called_once_with(span)
+        rest.on_end.assert_not_called()
+
     def test_on_start_forwarded_to_both(self):
         processor, rest, otlp = self._make_processor()
         span = _FakeSpan()
@@ -690,11 +794,11 @@ class TestContextAwareSpanProcessorRouting:
 def test_is_test_mode_kwarg_is_removed_from_settings():
     """Phase 2 hard-removed the kwarg. Calling with it must raise TypeError."""
     from deepeval.integrations.pydantic_ai.instrumentator import (
-        ConfidentInstrumentationSettings,
+        DeepEvalInstrumentationSettings,
     )
 
     with pytest.raises(TypeError):
-        ConfidentInstrumentationSettings(api_key="dummy", is_test_mode=False)
+        DeepEvalInstrumentationSettings(api_key="dummy", is_test_mode=False)
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +808,7 @@ def test_is_test_mode_kwarg_is_removed_from_settings():
 #
 # ``metric_collection`` is NOT in this list — it lives on the ``Trace``
 # (a trace-level field, alongside ``name`` / ``tags`` / etc.) and remains
-# an accepted ``ConfidentInstrumentationSettings`` kwarg as a
+# an accepted ``DeepEvalInstrumentationSettings`` kwarg as a
 # trace-default. ``trace_metric_collection`` was a redundant alias and IS
 # removed; use ``metric_collection`` instead.
 # ---------------------------------------------------------------------------
@@ -724,11 +828,70 @@ def test_is_test_mode_kwarg_is_removed_from_settings():
 def test_span_related_kwargs_are_removed_from_settings(kwarg):
     """Dropped span-level kwargs must raise TypeError on construction."""
     from deepeval.integrations.pydantic_ai.instrumentator import (
-        ConfidentInstrumentationSettings,
+        DeepEvalInstrumentationSettings,
     )
 
     with pytest.raises(TypeError):
-        ConfidentInstrumentationSettings(api_key="dummy", **{kwarg: object()})
+        DeepEvalInstrumentationSettings(api_key="dummy", **{kwarg: object()})
+
+
+# ---------------------------------------------------------------------------
+# Optional Confident AI api_key — the integration must NOT require a key.
+#
+# Historical behavior was a hard ``raise ValueError("CONFIDENT_API_KEY is
+# not set")`` from the constructor when neither an explicit ``api_key``
+# nor the ``CONFIDENT_API_KEY`` env var was present. That coupled the
+# whole pydantic-ai OTel pipeline to having a Confident AI account. The
+# rename to ``DeepEvalInstrumentationSettings`` lifts that requirement —
+# without a key the OTel pipeline still wires up locally; only the
+# outbound auth header is omitted.
+# ---------------------------------------------------------------------------
+
+
+def test_no_api_key_does_not_raise(monkeypatch):
+    """Constructor must succeed when no api_key is supplied or in env."""
+    from deepeval.integrations.pydantic_ai.instrumentator import (
+        DeepEvalInstrumentationSettings,
+    )
+
+    monkeypatch.delenv("CONFIDENT_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "deepeval.integrations.pydantic_ai.instrumentator."
+        "get_confident_api_key",
+        lambda: None,
+    )
+
+    instance = DeepEvalInstrumentationSettings()
+    assert instance is not None
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility: ``ConfidentInstrumentationSettings`` deprecated
+# alias must still construct (with a DeprecationWarning) and behave like
+# the new class.
+# ---------------------------------------------------------------------------
+
+
+def test_confident_alias_emits_deprecation_warning(monkeypatch):
+    """The old name still works but warns at instantiation time."""
+    from deepeval.integrations.pydantic_ai.instrumentator import (
+        ConfidentInstrumentationSettings,
+        DeepEvalInstrumentationSettings,
+    )
+
+    monkeypatch.delenv("CONFIDENT_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "deepeval.integrations.pydantic_ai.instrumentator."
+        "get_confident_api_key",
+        lambda: None,
+    )
+
+    with pytest.warns(DeprecationWarning, match="ConfidentInstrumentation"):
+        instance = ConfidentInstrumentationSettings()
+
+    # Subclass relationship — anywhere typed against the new name must
+    # still accept old-name instances.
+    assert isinstance(instance, DeepEvalInstrumentationSettings)
 
 
 # ---------------------------------------------------------------------------

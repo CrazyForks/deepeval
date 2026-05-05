@@ -2,7 +2,7 @@
 PydanticAI Metric Collection App: Agent with trace-level metric collection.
 Complexity: LOW - Tests trace-level online evaluation metric collection.
 
-Trace-level ``metric_collection`` is set via ``ConfidentInstrumentationSettings``
+Trace-level ``metric_collection`` is set via ``DeepEvalInstrumentationSettings``
 (it's a trace default, alongside ``name`` / ``tags`` / ``user_id`` / etc.).
 It can also be overridden at runtime from anywhere in the call stack via
 ``update_current_trace(metric_collection=...)`` — the runtime value wins.
@@ -18,7 +18,7 @@ from typing import Optional
 
 from pydantic_ai import Agent
 
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 
 
 def create_trace_metric_collection_agent(
@@ -30,7 +30,7 @@ def create_trace_metric_collection_agent(
     user_id: str = None,
 ) -> Agent:
     """Create a PydanticAI agent with trace-level ``metric_collection``."""
-    settings = ConfidentInstrumentationSettings(
+    settings = DeepEvalInstrumentationSettings(
         name=name,
         tags=tags or ["pydanticai", "trace-metric-collection"],
         metadata=metadata or {"test_type": "trace_metric_collection"},

@@ -4,7 +4,7 @@ Run AFTER Phase 2 lands to confirm the new behavior on Confident AI.
 
 Post-rewrite ergonomics (Langfuse-style):
 
-  - ``ConfidentInstrumentationSettings`` takes only essentials (api_key from
+  - ``DeepEvalInstrumentationSettings`` takes only essentials (api_key from
     env). All trace and span metadata is set at runtime via
     ``update_current_trace(...)`` and ``update_current_span(...)``.
   - Both helpers can be called from ANYWHERE in the call stack, including
@@ -37,7 +37,7 @@ from deepeval.tracing import (
     update_current_span,
     update_current_trace,
 )
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 
 
 # Unique per-script-run id so every trace produced by this run can be
@@ -46,7 +46,7 @@ from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
 RUN_ID = f"{Path(__file__).stem}-{uuid.uuid4().hex[:8]}"
 
 
-settings = ConfidentInstrumentationSettings()
+settings = DeepEvalInstrumentationSettings()
 
 agent = Agent(
     "openai:gpt-4o-mini",

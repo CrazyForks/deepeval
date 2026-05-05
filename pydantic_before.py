@@ -7,7 +7,7 @@ After Phase 2, this script will crash on `is_test_mode=False` with
 Limitations of today's syntax (this script demonstrates them honestly):
 
   - Trace metadata (name, thread_id, user_id, metadata, tags) is FROZEN at
-    ``ConfidentInstrumentationSettings(...)`` instantiation time.
+    ``DeepEvalInstrumentationSettings(...)`` instantiation time.
   - ``update_current_span(metadata=...)`` from inside ``@agent.tool_plain`` is a
     SILENT NO-OP — ``SpanInterceptor.on_start`` never pushes the OTel span onto
     ``current_span_context`` today, so there is no current span to mutate.
@@ -25,10 +25,10 @@ import os
 from pydantic_ai import Agent
 
 from deepeval.tracing import update_current_span
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 
 
-settings = ConfidentInstrumentationSettings(
+settings = DeepEvalInstrumentationSettings(
     name="pydantic-ai-validation",
     thread_id="thread-123",
     user_id="user-abc",

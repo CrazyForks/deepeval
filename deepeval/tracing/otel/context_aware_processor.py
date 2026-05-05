@@ -7,8 +7,15 @@ session:
 
   - REST path (``SimpleSpanProcessor(ConfidentSpanExporter())``) when
     ``current_trace_context`` is set OR ``trace_manager.is_evaluating`` is
-    True. This makes spans flow through ``trace_manager`` and unlocks pytest
-    tracing evals + ``evals_iterator`` for OTel-based integrations.
+    True OR trace-shape testing mode is active
+    (``trace_testing_manager.test_name`` is set). This makes spans flow
+    through ``trace_manager`` and unlocks pytest tracing evals +
+    ``evals_iterator`` for OTel-based integrations, and lets the
+    ``@assert_trace_json`` / ``@generate_trace_json`` test decorators
+    capture trace-shape JSON for bare ``agent.run(...)`` callers (no
+    ``@observe`` / ``with trace(...)`` wrapper) — the only path that
+    populates ``trace_testing_manager.test_dict`` is
+    ``trace_manager.end_trace``, which only fires on the REST path.
 
   - OTLP path (``BatchSpanProcessor(OTLPSpanExporter(...))``) otherwise.
     Direct push to Confident AI's OTel endpoint.
@@ -27,6 +34,7 @@ from typing import TYPE_CHECKING, Optional
 from deepeval.config.settings import get_settings
 from deepeval.tracing.context import current_trace_context
 from deepeval.tracing.otel.exporter import ConfidentSpanExporter
+from deepeval.tracing.trace_test_manager import trace_testing_manager
 from deepeval.tracing.tracing import trace_manager
 
 logger = logging.getLogger(__name__)
@@ -75,12 +83,17 @@ class ContextAwareSpanProcessor(_SpanProcessor):
     """Route OTel spans to REST or OTLP based on deepeval context state.
 
     Args:
-        api_key: Confident AI API key. Used as the ``x-confident-api-key``
-            header for the OTLP exporter and forwarded to
-            ``ConfidentSpanExporter`` for REST auth.
+        api_key: Optional Confident AI API key. When provided, used as
+            the ``x-confident-api-key`` header for the OTLP exporter and
+            forwarded to ``ConfidentSpanExporter`` for REST auth. When
+            ``None``, both delegates are still wired up — local span
+            translation continues to work — but outbound auth headers
+            are omitted, so the Confident AI backend will reject the
+            uploads. Pass a key when you actually want spans to land in
+            Confident AI.
     """
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: Optional[str] = None):
         if not _OTEL_AVAILABLE:
             raise ImportError(
                 "opentelemetry SDK is not installed. Install with "
@@ -93,10 +106,18 @@ class ContextAwareSpanProcessor(_SpanProcessor):
         self._rest_processor = SimpleSpanProcessor(
             ConfidentSpanExporter(api_key=api_key),
         )
+        # Only attach the auth header when we actually have a key — the
+        # OTLPSpanExporter forwards the headers dict verbatim onto every
+        # request, so a ``None`` value would either crash the gRPC/HTTP
+        # client at send time or get serialized as the literal string
+        # ``"None"`` server-side. Empty headers means the OTel pipeline
+        # still runs (useful for local debugging) but the Confident AI
+        # backend will reject the uploads.
+        otlp_headers = {"x-confident-api-key": api_key} if api_key else {}
         self._otlp_processor = BatchSpanProcessor(
             OTLPSpanExporter(
                 endpoint=_otlp_endpoint(),
-                headers={"x-confident-api-key": api_key},
+                headers=otlp_headers,
             ),
         )
 
@@ -113,7 +134,19 @@ class ContextAwareSpanProcessor(_SpanProcessor):
         ):
             return True
         try:
-            return bool(trace_manager.is_evaluating)
+            if trace_manager.is_evaluating:
+                return True
+        except Exception:
+            pass
+        # Trace-shape testing override: when a test harness has set
+        # ``trace_testing_manager.test_name``, force REST so spans flow
+        # through ``trace_manager.end_trace`` (the only writer of
+        # ``trace_testing_manager.test_dict``). Otherwise the
+        # ``@assert_trace_json`` decorator silently times out and compares
+        # ``{}`` to ``{}``, which trivially passes — masking real
+        # trace-shape regressions for bare ``agent.run(...)`` flows.
+        try:
+            return trace_testing_manager.test_name is not None
         except Exception:
             return False
 

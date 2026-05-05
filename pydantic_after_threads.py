@@ -83,7 +83,7 @@ from deepeval.tracing import (
     update_current_span,
     update_current_trace,
 )
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 
 
 # Unique per-script-run id so all 3 traces produced by this run can be
@@ -100,7 +100,7 @@ _request_ctx: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
 )
 
 
-settings = ConfidentInstrumentationSettings()
+settings = DeepEvalInstrumentationSettings()
 
 agent = Agent(
     "openai:gpt-4o-mini",

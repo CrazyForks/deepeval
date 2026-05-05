@@ -34,7 +34,7 @@ For a 5-minute getting-started guide, see the
 
 ```
                        ┌─────────────────────────────────────────┐
-   user code           │  Agent(instrument=ConfidentInstrumenta- │
+   user code           │  Agent(instrument=DeepEvalInstrumentationSettings- │
                        │     tionSettings(...))                  │
                        │  agent.run_sync("...")                  │
                        └──────────────────┬──────────────────────┘
@@ -65,7 +65,7 @@ For a 5-minute getting-started guide, see the
    └─────────────────────┘
 ```
 
-`ConfidentInstrumentationSettings` does the wiring (`TracerProvider`
+`DeepEvalInstrumentationSettings` does the wiring (`TracerProvider`
 creation, processor registration, global-tracer-provider set,
 forwarding to pydantic-ai's `Agent(instrument=...)`). It also carries
 trace-level defaults.
@@ -95,7 +95,7 @@ trace context is active and whether the current trace is "implicit"
 ## Public API surface
 
 ```python
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 ```
 
 That's the only symbol exported by this module. Everything else is the
@@ -134,14 +134,14 @@ distinguished by what (if anything) wraps the call.
 ### Mode 1: Bare `agent.run` / `agent.run_sync`
 
 ```python
-agent = Agent("openai:gpt-4o-mini", instrument=ConfidentInstrumentationSettings())
+agent = Agent("openai:gpt-4o-mini", instrument=DeepEvalInstrumentationSettings())
 result = agent.run_sync("hello")
 ```
 
 - **No** enclosing `@observe` or `with trace(...)`.
 - The user has not pushed any deepeval trace context.
 - `SpanInterceptor.on_start` for the OTel root span pushes an
-  *implicit* `Trace` placeholder onto `current_trace_context`, tagged
+  _implicit_ `Trace` placeholder onto `current_trace_context`, tagged
   `is_otel_implicit=True`. This placeholder exists only so that
   `update_current_trace(...)` from inside a tool body has something to
   mutate; the value flows back to the OTel attributes via the standard
@@ -207,7 +207,7 @@ it, every "why doesn't my call do anything" question answers itself.
   placeholder it's about to push. One-shot per slot.
 - Works regardless of mode (bare / `with trace` / `@observe`).
 
-### Declarative: `ConfidentInstrumentationSettings(...)`
+### Declarative: `DeepEvalInstrumentationSettings(...)`
 
 - **Trace-level defaults baked into the agent.** Resolved at every
   span's `on_end` as a fallback under the active trace context.
@@ -215,26 +215,26 @@ it, every "why doesn't my call do anything" question answers itself.
 
 ### When to use which
 
-| Goal | Bare mode | `with trace(...)` / `@observe` |
-|---|---|---|
-| Trace `name`/`user_id`/`tags` known at agent-construction | `ConfidentInstrumentationSettings(name=..., ...)` | same |
-| Trace fields known per call, before agent.run | use `with trace(...)` instead — there is no `next_trace(...)` | `with trace(name=...)` |
-| Trace fields known *during* agent.run (e.g. derived from tool result) | `update_current_trace(...)` from inside a tool body | `update_current_trace(...)` from anywhere inside |
-| Agent-span fields per call, before agent.run | `with next_agent_span(...)` | `with next_agent_span(...)` |
-| LLM-span fields per call, before agent.run | `with next_llm_span(...)` | `with next_llm_span(...)` |
-| Tool-span fields | `update_current_span(...)` / `update_tool_span(...)` from inside the tool body | same |
+| Goal                                                                  | Bare mode                                                                      | `with trace(...)` / `@observe`                   |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------ |
+| Trace `name`/`user_id`/`tags` known at agent-construction             | `DeepEvalInstrumentationSettings(name=..., ...)`                               | same                                             |
+| Trace fields known per call, before agent.run                         | use `with trace(...)` instead — there is no `next_trace(...)`                  | `with trace(name=...)`                           |
+| Trace fields known _during_ agent.run (e.g. derived from tool result) | `update_current_trace(...)` from inside a tool body                            | `update_current_trace(...)` from anywhere inside |
+| Agent-span fields per call, before agent.run                          | `with next_agent_span(...)`                                                    | `with next_agent_span(...)`                      |
+| LLM-span fields per call, before agent.run                            | `with next_llm_span(...)`                                                      | `with next_llm_span(...)`                        |
+| Tool-span fields                                                      | `update_current_span(...)` / `update_tool_span(...)` from inside the tool body | same                                             |
 
 ---
 
 ## What lives where (configuration matrix)
 
-| Layer | Where you can write to it from |
-|---|---|
-| **Trace** | (a) `ConfidentInstrumentationSettings(...)` defaults <br> (b) `with trace(...)` kwargs <br> (c) `update_current_trace(...)` from inside an active trace context (any tool body, `@observe` body, or `with trace(...)` body) |
-| **Agent span** | (a) `with next_agent_span(...)` BEFORE `agent.run` <br> (b) NOT reachable from inside the agent — pydantic-ai owns the agent span body |
-| **LLM span** | (a) `with next_llm_span(...)` BEFORE `agent.run` <br> (b) NOT reachable from inside — pydantic-ai opens it around the model call |
-| **Tool span** | (a) `update_current_span(...)` / `update_tool_span(...)` from INSIDE the `@agent.tool_plain` function body <br> (b) `with next_tool_span(...)` BEFORE `agent.run` (one-shot, hits the FIRST tool span only) |
-| **Retriever span** | (a) `update_current_span(...)` / `update_retriever_span(...)` from INSIDE the retriever function body <br> (b) `with next_retriever_span(...)` BEFORE `agent.run` |
+| Layer              | Where you can write to it from                                                                                                                                                                                             |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Trace**          | (a) `DeepEvalInstrumentationSettings(...)` defaults <br> (b) `with trace(...)` kwargs <br> (c) `update_current_trace(...)` from inside an active trace context (any tool body, `@observe` body, or `with trace(...)` body) |
+| **Agent span**     | (a) `with next_agent_span(...)` BEFORE `agent.run` <br> (b) NOT reachable from inside the agent — pydantic-ai owns the agent span body                                                                                     |
+| **LLM span**       | (a) `with next_llm_span(...)` BEFORE `agent.run` <br> (b) NOT reachable from inside — pydantic-ai opens it around the model call                                                                                           |
+| **Tool span**      | (a) `update_current_span(...)` / `update_tool_span(...)` from INSIDE the `@agent.tool_plain` function body <br> (b) `with next_tool_span(...)` BEFORE `agent.run` (one-shot, hits the FIRST tool span only)                |
+| **Retriever span** | (a) `update_current_span(...)` / `update_retriever_span(...)` from INSIDE the retriever function body <br> (b) `with next_retriever_span(...)` BEFORE `agent.run`                                                          |
 
 The asymmetry between agent/LLM and tool/retriever is structural:
 **user code never runs inside agent or LLM spans** in pydantic-ai
@@ -248,7 +248,7 @@ internals). User code DOES run inside tool/retriever bodies.
 ### Settings defaults (most common)
 
 ```python
-settings = ConfidentInstrumentationSettings(
+settings = DeepEvalInstrumentationSettings(
     name="my-app",
     user_id="user-123",
     thread_id="thread-456",
@@ -423,11 +423,11 @@ next_agent_span sets the floor at on_start
 
 `ContextAwareSpanProcessor._should_route_to_rest()` decides per span:
 
-| Active deepeval context | Trace.is_otel_implicit | Routing |
-|---|---|---|
-| None | — | **OTLP** |
-| Real (`with trace`, `@observe`) | False | **REST** |
-| Implicit (bare `agent.run`) | True | **OTLP** |
+| Active deepeval context         | Trace.is_otel_implicit | Routing  |
+| ------------------------------- | ---------------------- | -------- |
+| None                            | —                      | **OTLP** |
+| Real (`with trace`, `@observe`) | False                  | **REST** |
+| Implicit (bare `agent.run`)     | True                   | **OTLP** |
 
 Why "implicit" goes OTLP: the bare caller didn't ask for REST
 behavior. The implicit placeholder is purely a write target for
@@ -445,6 +445,7 @@ Everything in this integration is built on `contextvars.ContextVar`,
 which means:
 
 ### Asyncio tasks
+
 Each `asyncio.create_task(...)` snapshots the parent's context. Mutations
 via `ContextVar.set(...)` from inside a task do NOT propagate back to
 the parent. This applies to `update_current_*` (which doesn't
@@ -452,6 +453,7 @@ re-`set`, it mutates the placeholder object — fine) and to
 `next_*_span` slot draining.
 
 ### Threads
+
 `concurrent.futures.ThreadPoolExecutor` workers do NOT inherit
 contextvars from the submitting thread by default; you have to wrap
 with `contextvars.copy_context()`. Pydantic AI uses `anyio.to_thread.run_sync`
@@ -462,7 +464,7 @@ the main thread.
 ### The "sub-context drain" subtlety
 
 `Agent.run_sync(...)` calls `asyncio.run(...)` internally, which
-creates a new asyncio context that inherits a *snapshot* of the
+creates a new asyncio context that inherits a _snapshot_ of the
 parent's contextvars.
 
 A naive design that consumed `next_*_span` slots via
@@ -471,7 +473,7 @@ the snapshot — invisible to the outer `with` block. A second
 `agent.run_sync` would then re-consume the same value.
 
 Solution (already implemented): `next_*_span` stores a `_PendingSlot`
-*wrapper* in the contextvar. The consumer drains via
+_wrapper_ in the contextvar. The consumer drains via
 `slot.payload = None` (mutation on the shared object), not
 `ContextVar.set(None)`. Both contexts see the mutation because they
 inherit the same wrapper reference.
@@ -504,7 +506,7 @@ The implicit placeholder is pushed inside `agent.run_sync` (at root
 span on_start). Before the call, `current_trace_context.get()` returns
 `None`. `update_current_trace` returns early.
 
-**Fix**: use `ConfidentInstrumentationSettings(name="X")` for static
+**Fix**: use `DeepEvalInstrumentationSettings(name="X")` for static
 defaults, `with trace(name="X")` for per-call (REST mode), or
 `update_current_trace` from inside a tool body.
 
@@ -595,13 +597,15 @@ name. To rename a span, set the agent's `name` at `Agent(name="...")`.
 ### `metric_collection` precedence
 
 For traces:
+
 ```
 update_current_trace(metric_collection=…)   # wins if set during run
-   > ConfidentInstrumentationSettings(metric_collection=…)
+   > DeepEvalInstrumentationSettings(metric_collection=…)
    > <not stamped>
 ```
 
 For spans:
+
 ```
 update_current_span(metric_collection=…) from inside the span body
    > next_*_span(metric_collection=…) BEFORE the span starts
@@ -619,7 +623,7 @@ update_current_span(metric_collection=…) from inside the span body
 ### Pattern 1: Single agent, static config
 
 ```python
-settings = ConfidentInstrumentationSettings(
+settings = DeepEvalInstrumentationSettings(
     name="my-bot",
     metric_collection="prod-metrics",
     metadata={"env": "prod"},
@@ -738,21 +742,21 @@ establishes its own context, so isolation holds. See
 
 ## Field reference
 
-### `ConfidentInstrumentationSettings(...)`
+### `DeepEvalInstrumentationSettings(...)`
 
 All optional. All trace-level (no per-span configuration).
 
-| Kwarg | Type | Description |
-|---|---|---|
-| `api_key` | `str` | Confident AI API key. Falls back to `CONFIDENT_API_KEY` env / `deepeval login`. |
-| `name` | `str` | Default trace name. |
-| `thread_id` | `str` | Default thread id. |
-| `user_id` | `str` | Default user id. |
-| `metadata` | `dict` | Default trace metadata (merged base under runtime overlay). |
-| `tags` | `list[str]` | Default trace tags. |
-| `metric_collection` | `str` | Default trace metric_collection. |
-| `test_case_id` | `str` | Default test_case_id. |
-| `turn_id` | `str` | Default turn_id. |
+| Kwarg               | Type        | Description                                                                     |
+| ------------------- | ----------- | ------------------------------------------------------------------------------- |
+| `api_key`           | `str`       | Confident AI API key. Falls back to `CONFIDENT_API_KEY` env / `deepeval login`. |
+| `name`              | `str`       | Default trace name.                                                             |
+| `thread_id`         | `str`       | Default thread id.                                                              |
+| `user_id`           | `str`       | Default user id.                                                                |
+| `metadata`          | `dict`      | Default trace metadata (merged base under runtime overlay).                     |
+| `tags`              | `list[str]` | Default trace tags.                                                             |
+| `metric_collection` | `str`       | Default trace metric_collection.                                                |
+| `test_case_id`      | `str`       | Default test_case_id.                                                           |
+| `turn_id`           | `str`       | Default turn_id.                                                                |
 
 Removed in the refactor (will raise `TypeError`):
 `is_test_mode`, `confident_prompt`, `trace_metric_collection`,
@@ -764,6 +768,7 @@ authoritative list.
 ### `next_span(...)`, `next_agent_span(...)`, `next_llm_span(...)`, `next_tool_span(...)`, `next_retriever_span(...)`
 
 Each typed helper accepts:
+
 - The same **base** kwargs `update_current_span(...)` accepts (`input`,
   `output`, `metadata`, `name`, `metric_collection`, `metrics`,
   `test_case`, etc.).
@@ -799,13 +804,13 @@ configuring before the span opens).
 
 Runnable end-to-end checks at the repo root:
 
-| Script | What it validates |
-|---|---|
-| `pydantic_after.py` | `update_current_trace` / `update_current_span` from inside tool bodies (the canonical `@observe` flow). |
-| `pydantic_after_bare.py` | Same dynamics work with bare `agent.run` (implicit Trace placeholder). |
-| `pydantic_after_concurrent.py` | ContextVar isolation across `asyncio.gather`. |
-| `pydantic_after_threads.py` | ContextVar propagation across `ThreadPoolExecutor` + `anyio.to_thread.run_sync`. |
-| `pydantic_after_next_span.py` | All four `next_agent_span` / `next_llm_span` scenarios: simple, stacked, one-shot, nested. |
+| Script                         | What it validates                                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `pydantic_after.py`            | `update_current_trace` / `update_current_span` from inside tool bodies (the canonical `@observe` flow). |
+| `pydantic_after_bare.py`       | Same dynamics work with bare `agent.run` (implicit Trace placeholder).                                  |
+| `pydantic_after_concurrent.py` | ContextVar isolation across `asyncio.gather`.                                                           |
+| `pydantic_after_threads.py`    | ContextVar propagation across `ThreadPoolExecutor` + `anyio.to_thread.run_sync`.                        |
+| `pydantic_after_next_span.py`  | All four `next_agent_span` / `next_llm_span` scenarios: simple, stacked, one-shot, nested.              |
 
 Each script needs `CONFIDENT_API_KEY` and `OPENAI_API_KEY` in env and
 prints the expected dashboard outcome at the end so you can spot-check

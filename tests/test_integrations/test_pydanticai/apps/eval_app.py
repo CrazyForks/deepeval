@@ -2,7 +2,7 @@
 PydanticAI Evals App: Comprehensive trace-level features.
 Complexity: MEDIUM - Tests trace-level metadata + tool spans.
 
-After the settings refactor, ``ConfidentInstrumentationSettings`` carries
+After the settings refactor, ``DeepEvalInstrumentationSettings`` carries
 ONLY trace-level defaults (``name``, ``thread_id``, ``user_id``, ``tags``,
 ``metadata``, ``metric_collection``, ``test_case_id``, ``turn_id``).
 Per-span configuration is set at runtime — either by ``update_current_*_span(...)``
@@ -16,7 +16,7 @@ Uses deterministic settings (temperature=0) for reproducible traces.
 from typing import Dict, List, Optional
 from pydantic_ai import Agent
 
-from deepeval.integrations.pydantic_ai import ConfidentInstrumentationSettings
+from deepeval.integrations.pydantic_ai import DeepEvalInstrumentationSettings
 from deepeval.tracing import next_agent_span
 
 
@@ -30,7 +30,7 @@ def create_evals_agent(
 ) -> Agent:
     """Create a PydanticAI agent with trace-level instrumentation settings."""
 
-    settings = ConfidentInstrumentationSettings(
+    settings = DeepEvalInstrumentationSettings(
         name=name,
         tags=tags or ["pydanticai", "evals"],
         metadata=metadata or {"test_type": "evals"},

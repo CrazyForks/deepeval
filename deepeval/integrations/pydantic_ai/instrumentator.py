@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import warnings
 from time import perf_counter
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -116,7 +117,7 @@ else:
 init_clock_bridge()  # initialize clock bridge for perf_counter() to epoch_nanos conversion
 
 
-class ConfidentInstrumentationSettings(InstrumentationSettings):
+class DeepEvalInstrumentationSettings(InstrumentationSettings):
     """Pydantic AI ``InstrumentationSettings`` that wires deepeval's OTel
     pipeline.
 
@@ -141,6 +142,15 @@ class ConfidentInstrumentationSettings(InstrumentationSettings):
     use ``update_current_span(metric_collection=..., metadata=..., ...)``
     from inside your tool / agent body. The span placeholder pushed by
     ``SpanInterceptor.on_start`` is the write target.
+
+    A Confident AI ``api_key`` is fully optional. When omitted (and
+    ``CONFIDENT_API_KEY`` isn't in the environment), the OTel pipeline
+    still runs locally — spans are produced and the ``SpanInterceptor``
+    still translates them into ``confident.*`` attributes — but no
+    ``x-confident-api-key`` header is attached to the OTLP exporter, so
+    the Confident AI backend will reject the upload. Wire a key whenever
+    you actually want traces to land in Confident AI; otherwise this
+    class is fine to use as a pure local OTel instrumentation.
     """
 
     def __init__(
@@ -180,10 +190,13 @@ class ConfidentInstrumentationSettings(InstrumentationSettings):
         self.test_case_id = test_case_id
         self.turn_id = turn_id
 
+        # Resolve api_key from env if not supplied. May still be None —
+        # we deliberately do NOT raise. The OTel pipeline is still useful
+        # without a Confident AI key (local span generation, attribute
+        # translation, ContextAwareSpanProcessor routing); only the
+        # outbound auth header is gated on the key being present.
         if not api_key:
             api_key = get_confident_api_key()
-            if not api_key:
-                raise ValueError("CONFIDENT_API_KEY is not set")
 
         trace_provider = TracerProvider()
 
@@ -208,12 +221,35 @@ class ConfidentInstrumentationSettings(InstrumentationSettings):
         super().__init__(tracer_provider=trace_provider)
 
 
+class ConfidentInstrumentationSettings(DeepEvalInstrumentationSettings):
+    """Deprecated alias for :class:`DeepEvalInstrumentationSettings`.
+
+    The original name implied a Confident AI account was required. Now
+    that the API key is fully optional, the class is named after the SDK
+    that owns it (``deepeval``) rather than the cloud product it
+    optionally uploads to. Use ``DeepEvalInstrumentationSettings``
+    directly in new code; this alias remains for backward compatibility
+    and will be removed in a future release.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        warnings.warn(
+            "ConfidentInstrumentationSettings is deprecated and will be "
+            "removed in a future version. Use "
+            "DeepEvalInstrumentationSettings instead — same constructor, "
+            "and a Confident AI api_key is now optional.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
+
 class SpanInterceptor(SpanProcessor):
     """Translate Pydantic AI OTel spans into deepeval ``confident.*`` attrs.
 
     Trace-level attrs (``confident.trace.*``) are resolved per-span as a
     union of the live ``current_trace_context`` (mutated anywhere via
-    ``update_current_trace(...)``) and the ``ConfidentInstrumentationSettings``
+    ``update_current_trace(...)``) and the ``DeepEvalInstrumentationSettings``
     trace defaults (``name``, ``thread_id``, ``user_id``, ``tags``,
     ``metadata``, ``metric_collection``, ``test_case_id``, ``turn_id``)
     — context wins on any field it touches, settings fall back.
@@ -227,13 +263,13 @@ class SpanInterceptor(SpanProcessor):
     Langfuse's SDK. At ``on_end`` the placeholder's mutated fields are
     serialized back into ``confident.span.*`` OTel attributes so the
     exporter (REST or OTLP) picks them up.
-    ``ConfidentInstrumentationSettings`` carries no span-level fields by
+    ``DeepEvalInstrumentationSettings`` carries no span-level fields by
     design — span configuration is a runtime concern.
     """
 
     LLM_OPERATION_NAMES = {"chat", "generate_content", "text_completion"}
 
-    def __init__(self, settings_instance: ConfidentInstrumentationSettings):
+    def __init__(self, settings_instance: DeepEvalInstrumentationSettings):
         self.settings = settings_instance
         # Per-OTel-span state, keyed by span_id. Two spans never share an id
         # within a process so this is safe across threads / asyncio tasks.
@@ -272,6 +308,16 @@ class SpanInterceptor(SpanProcessor):
         # existing per-span ``_serialize_trace_context_to_otel_attrs`` since
         # it reads from ``current_trace_context`` at every ``on_end``.
         self._maybe_push_implicit_trace_context(span)
+
+        # ----- bridge OTel root span to enclosing deepeval span -----
+        # When an OTel root span starts inside a deepeval-managed span (the
+        # canonical case being ``@observe(type="agent") -> agent.run(...)``),
+        # OTel sees no parent and the exporter would otherwise emit it as a
+        # second trace root, sibling to the ``@observe`` span. Stamp the
+        # enclosing deepeval span's UUID as a logical-parent override so the
+        # exporter can re-parent the OTel root onto it. Only fires for OTel
+        # roots; child OTel spans keep their native parent_uuid.
+        self._maybe_bridge_otel_root_to_deepeval_parent(span)
 
         # ----- per-span classification (no settings dependency) -----
         # Span classification (agent / llm / tool) happens at on_start
@@ -468,6 +514,45 @@ class SpanInterceptor(SpanProcessor):
                 "Failed to push implicit current_trace_context: %s", exc
             )
 
+    def _maybe_bridge_otel_root_to_deepeval_parent(self, span) -> None:
+        """Re-parent an OTel root span onto its enclosing deepeval span.
+
+        When ``@observe(type="agent")`` (or any deepeval-managed span) wraps
+        a bare ``agent.run(...)`` call, the deepeval span is created off-OTel
+        and pushed onto ``current_span_context``, but no OTel parent context
+        is established. Pydantic AI then opens an OTel root span (no native
+        parent), and the exporter would otherwise emit it as a second trace
+        root sibling to the ``@observe`` span — visually the two appear as
+        two separate agent spans rather than parent → child.
+
+        We close that gap by stamping the deepeval span's UUID onto the OTel
+        root as ``confident.span.parent_uuid``. ``ConfidentSpanExporter``
+        prefers this override iff the OTel span has no native parent, so the
+        re-parenting only affects the dual-root case and never overrides a
+        real OTel parent_id for nested OTel spans.
+        """
+        # Only OTel roots need bridging; child OTel spans already have a
+        # real parent_id pointing into the same OTel trace.
+        if getattr(span, "parent", None) is not None:
+            return
+        parent_span = current_span_context.get()
+        if parent_span is None:
+            return
+        parent_uuid = getattr(parent_span, "uuid", None)
+        if not parent_uuid:
+            return
+        try:
+            self._set_attr_post_end(
+                span, "confident.span.parent_uuid", parent_uuid
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to bridge OTel root span to deepeval parent "
+                "(parent_uuid=%s): %s",
+                parent_uuid,
+                exc,
+            )
+
     def _maybe_pop_implicit_trace_context(self, span) -> None:
         """Pop the implicit trace placeholder pushed at ``on_start``.
 
@@ -595,7 +680,7 @@ class SpanInterceptor(SpanProcessor):
 
         Reads from ``current_trace_context`` (so ``update_current_trace(...)``
         from anywhere in the call stack lands on every OTel span) with
-        ``ConfidentInstrumentationSettings`` trace defaults (``name``,
+        ``DeepEvalInstrumentationSettings`` trace defaults (``name``,
         ``thread_id``, ``user_id``, ``tags``, ``metadata``,
         ``metric_collection``, ``test_case_id``, ``turn_id``) as
         fallback. Metadata merges settings as base + runtime context on

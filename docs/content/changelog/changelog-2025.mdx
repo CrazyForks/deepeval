@@ -18,7 +18,6 @@ sidebar_label: 🐍 2025
 
 - `LLMTestCaseParams` has been renamed to `SingleTurnParams`, and `TurnParams` has been renamed to `MultiTurnParams`, so the names line up with the AI system being evaluated rather than the underlying object. The old names still work but importing them now emits a `DeprecationWarning`; switch to `SingleTurnParams` / `MultiTurnParams` to silence it. GEval also now treats `metadata` and `tags` strictly as test-case-level params for `ConversationalTestCase` (they're no longer pulled from individual turns into the prompt).
 
-
 ## Thank you to our contributors
 
 First things first, DeepEval exists because of everyone who opened issues, reviewed changes, wrote docs, and merged code this year. Thank you for shaping every release with us.
@@ -402,7 +401,7 @@ September made agent evaluation and tracing easier to adopt with expanded quicks
 
 - Add support for `name` and `comments` fields when loading goldens from CSV/JSON and when exporting datasets via `save_as`, preserving this metadata across round-trips. ([#2066](https://github.com/confident-ai/deepeval/pull/2066)) {/* pr:2066 */} ([Vamshi Adimalla](https://github.com/A-Vamshi))
 - Fix a typo in the agents getting-started guide so the end-to-end evaluation instructions read correctly. ([#2095](https://github.com/confident-ai/deepeval/pull/2095)) {/* pr:2095 */} ([Raj Ravi](https://github.com/RajRavi05))
-- Improve PydanticAI OpenTelemetry instrumentation by reviving and consolidating it under `ConfidentInstrumentationSettings`. Agent-level tracing and metric wiring is now configured via the `instrument` setting, and the old `instrument_pydantic_ai` path is deprecated. ([#2098](https://github.com/confident-ai/deepeval/pull/2098)) {/* pr:2098 */} ([Mayank](https://github.com/spike-spiegel-21))
+- Improve PydanticAI OpenTelemetry instrumentation by reviving and consolidating it under `DeepEvalInstrumentationSettings`. Agent-level tracing and metric wiring is now configured via the `instrument` setting, and the old `instrument_pydantic_ai` path is deprecated. ([#2098](https://github.com/confident-ai/deepeval/pull/2098)) {/* pr:2098 */} ([Mayank](https://github.com/spike-spiegel-21))
 
 #### v3.5.5
 
