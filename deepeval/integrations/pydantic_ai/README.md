@@ -22,11 +22,15 @@ For a 5-minute getting-started guide, see the
 - [Configuring spans](#configuring-spans)
 - [Resolution & precedence](#resolution--precedence)
 - [Routing: REST vs OTLP](#routing-rest-vs-otlp)
+- [Carrying non-attr Python objects across OTel](#carrying-non-attr-python-objects-across-otel)
+- [Cross-layer parent bridging](#cross-layer-parent-bridging)
 - [Concurrency: asyncio, threads, sub-contexts](#concurrency-asyncio-threads-sub-contexts)
 - [Edge cases and pitfalls](#edge-cases-and-pitfalls)
 - [Application patterns](#application-patterns)
 - [Field reference](#field-reference)
 - [Validation scripts](#validation-scripts)
+- [Test suite](#test-suite)
+- [Extending the pattern to other OTel integrations](#extending-the-pattern-to-other-otel-integrations)
 
 ---
 
@@ -421,21 +425,103 @@ next_agent_span sets the floor at on_start
 
 ## Routing: REST vs OTLP
 
-`ContextAwareSpanProcessor._should_route_to_rest()` decides per span:
+`ContextAwareSpanProcessor._should_route_to_rest()` decides per span,
+checked in this order (first match wins):
 
-| Active deepeval context         | Trace.is_otel_implicit | Routing  |
-| ------------------------------- | ---------------------- | -------- |
-| None                            | —                      | **OTLP** |
-| Real (`with trace`, `@observe`) | False                  | **REST** |
-| Implicit (bare `agent.run`)     | True                   | **OTLP** |
+| Signal                                                               | Routing  |
+| -------------------------------------------------------------------- | -------- |
+| Real deepeval trace context (`with trace`, `@observe`)               | **REST** |
+| `trace_manager.is_evaluating` (any eval pipeline active)             | **REST** |
+| `trace_testing_manager.test_name` set (schema-test harness override) | **REST** |
+| None of the above                                                    | **OTLP** |
 
-Why "implicit" goes OTLP: the bare caller didn't ask for REST
-behavior. The implicit placeholder is purely a write target for
+Why "implicit" (bare `agent.run`) goes OTLP: the caller didn't ask for
+REST behavior. The implicit placeholder is purely a write target for
 `update_current_trace(...)`; promoting it to REST would silently
 change user-visible behavior.
 
+Why `is_evaluating` overrides: during `dataset.evals_iterator(...)`
+or pytest-driven eval, the eval pipeline is the only consumer of the
+trace, and it reads from `trace_manager.traces_to_evaluate` populated
+by the REST exporter. OTLP would silently drop the trace from eval.
+
+Why `test_name` overrides: without it, schema-asserted bare-mode
+tests would compare `{}` to `{}` and trivially pass — REST routing
+ensures `trace_manager.end_trace` is the writer of
+`trace_testing_manager.test_dict`.
+
 `SpanInterceptor` does NOT decide routing. It just produces
 `confident.*` attributes; both transports read the same attributes.
+
+---
+
+## Carrying non-attr Python objects across OTel
+
+OTel attributes are limited to primitives + primitive sequences. That's
+fine for `metadata`, `tags`, `metric_collection` etc., but `BaseSpan`
+also carries fields that are full Python instances:
+
+- `metrics: List[BaseMetric]` — staged via `next_*_span(metrics=[...])`,
+  consumed by the eval pipeline.
+
+These can't ride inside the OTel span. To carry them from
+`SpanInterceptor.on_end` (writer) to `ConfidentSpanExporter` (reader)
+in-process, we use a module-level registry in
+`deepeval/tracing/otel/utils.py`:
+
+```python
+stash_pending_metrics(uuid, metrics)   # SpanInterceptor.on_end
+pop_pending_metrics(uuid)              # ConfidentSpanExporter
+```
+
+Keyed by deepeval span uuid (16-char hex of OTel `span_id`), pop
+semantics for self-cleaning. The writer is gated on
+`trace_manager.is_evaluating`, because:
+
+- These instances are only meaningful in the client-side eval pipeline
+  (`metric_collection: str` covers the server-side online-eval case
+  and rides as a normal OTel attr — don't conflate the two).
+- In production paths the OTLP collector usually lives in a different
+  process running its own `ConfidentSpanExporter`, so the reader would
+  never fire and the entries would leak.
+
+If you find yourself adding a new non-primitive field to `BaseSpan`
+(or any subclass) and want it to survive OTel transport, extend this
+registry pattern with a parallel pair of helpers — don't try to JSON
+the unjsonable.
+
+---
+
+## Cross-layer parent bridging
+
+Native `@observe` and OTel-native instrumentation can coexist in the
+same call tree:
+
+```python
+@observe(name="handler")
+def handle(query: str) -> str:
+    return agent.run_sync(query).output
+```
+
+The `@observe` span is created by the deepeval Observer and lives in
+`current_span_context`. `agent.run_sync` then creates an OTel span
+that has no native OTel parent (deepeval's span isn't an OTel span).
+Without help, the OTel span would land as a separate root in the
+trace, producing two siblings instead of `handler → agent`.
+
+`SpanInterceptor.on_start` solves this by reading
+`current_span_context.get()` when the OTel span is an OTel root, and
+stamping a `confident.span.parent_uuid` attribute on the OTel span
+pointing at the enclosing deepeval span's uuid. The exporter reads
+that attribute via `_resolve_parent_uuid` and uses it as the
+`parent_uuid` on the rebuilt deepeval span.
+
+If you're writing a new OTel integration that may produce OTel root
+spans inside an enclosing `@observe` / `with trace(...)` context,
+mirror this: in your `on_start`, check whether the OTel span is a
+root (`span.parent is None`) AND whether `current_span_context.get()`
+is a real (non-implicit) deepeval span; if so, stamp
+`confident.span.parent_uuid`.
 
 ---
 
@@ -583,7 +669,15 @@ agent-specific fields (`available_tools`, `agent_handoffs`) are
 present on the `AgentSpan` placeholder but not currently serialized.
 Mutating them via `next_agent_span(available_tools=[...])` updates the
 placeholder but won't surface in the trace JSON without an exporter
-update. This is a known gap; flagged for future work.
+update.
+
+For JSON-serializable values (`available_tools` / `agent_handoffs`
+are lists of structured dicts), the fix is to add them to
+`_serialize_placeholder_to_otel_attrs` and read them back in the
+exporter, like `metric_collection`/`tools_called` already do.
+
+For Python instances that can't be JSON'd (the `metrics` field), see
+[Carrying non-attr Python objects](#carrying-non-attr-python-objects-across-otel).
 
 ### Span name collision
 
@@ -828,3 +922,114 @@ Integration tests (real LLMs, schema-asserted):
 Schemas in `tests/test_integrations/test_pydanticai/schemas/` are
 generated via `GENERATE_SCHEMAS=true pytest ...` and asserted in normal
 mode.
+
+---
+
+## Extending the pattern to other OTel integrations
+
+Most of the surface above is reusable for any framework that
+auto-instruments via OTel (LangChain, CrewAI, LlamaIndex, custom
+agents, etc.). The shared deepeval-side machinery
+(`ContextAwareSpanProcessor`, `ConfidentSpanExporter`,
+`pop_pending_for` / `apply_pending_to_span`, the metrics overlay,
+the parent-bridge mechanism) is framework-agnostic; what's
+framework-specific is just the SpanInterceptor.
+
+### What stays the same
+
+- **Routing** is owned by `ContextAwareSpanProcessor`. Any integration
+  that registers spans through a `TracerProvider` containing this
+  processor gets REST routing during `with trace`/`@observe`/eval/test
+  for free.
+- **Pending-slot consumption** (`pop_pending_for(span_type)` +
+  `apply_pending_to_span`) is the contract for `next_*_span(...)`
+  staging. Native `@observe` and OTel SpanInterceptors both call into
+  it; consumers don't need to know which side they're on.
+- **Metrics overlay** (`stash_pending_metrics` / `pop_pending_metrics`
+  in `deepeval/tracing/otel/utils.py`) is shared infrastructure. Any
+  OTel integration that supports `next_*_span(metrics=[...])` writes
+  to it at on_end (gated on `is_evaluating`); the exporter reads from
+  it.
+- **Parent-bridge** (`confident.span.parent_uuid` attribute resolved
+  by the exporter's `_resolve_parent_uuid`) is universal. Stamp it on
+  OTel roots when an enclosing deepeval span exists.
+- **Trace context attrs** (`confident.trace.*`) are produced by the
+  same helper pattern — refresh from `current_trace_context.get()` at
+  on_end, fall back to settings, write via `_set_attr_post_end`.
+
+### What's framework-specific (your `SpanInterceptor` needs to do)
+
+- **Span classification.** Read whatever `gen_ai.*` (or
+  framework-native) attributes the framework writes and decide if the
+  OTel span is an `agent` / `llm` / `tool` / `retriever` / generic. The
+  classification result becomes `confident.span.type` and decides
+  which placeholder subclass (`AgentSpan` / `LlmSpan` / …) you push
+  onto `current_span_context`.
+- **Implicit-trace push** (optional, recommended). If the framework
+  supports a "bare call with no enclosing context" mode, push an
+  `is_otel_implicit=True` `Trace` placeholder at the OTel root's
+  `on_start` so `update_current_trace(...)` from inside framework
+  internals (e.g. tool bodies) has somewhere to write. Pop it at the
+  same span's `on_end`.
+- **Placeholder serialization.** At `on_end`, write user-mutated
+  fields back to `confident.span.*` OTel attrs. The exporter reads
+  primitives only — non-primitive fields go through the metrics
+  overlay (or get JSON-stringified for read-only display fields).
+- **`gen_ai`-attr → confident-attr translation.** Things like the
+  framework's per-LLM-call token counts, model name, prompt content
+  live in `gen_ai.*` attrs on the OTel span before your interceptor
+  ever sees them. Map them to `confident.span.*` (or rely on the
+  exporter's existing `check_*_from_gen_ai_attributes` helpers in
+  `deepeval/tracing/otel/utils.py`).
+
+### Porting checklist
+
+1. Implement `on_start(span, parent_context)`:
+   - Classify span type from framework attrs.
+   - Stamp `confident.span.type`.
+   - Build a typed `BaseSpan` placeholder.
+   - `apply_pending_to_span(placeholder, pop_pending_for(span_type))`.
+   - If OTel root + enclosing real deepeval span → stamp
+     `confident.span.parent_uuid`.
+   - If OTel root + no enclosing trace → push implicit
+     `Trace(is_otel_implicit=True)` onto `current_trace_context`.
+   - Push placeholder onto `current_span_context`, store the token.
+2. Implement `on_end(span)`:
+   - Refresh `confident.trace.*` from `current_trace_context` +
+     settings.
+   - Pop placeholder, reset context-var token.
+   - Serialize placeholder mutations to `confident.span.*` attrs.
+   - If `placeholder.metrics and trace_manager.is_evaluating`,
+     `stash_pending_metrics(uuid, placeholder.metrics)`.
+   - If you pushed an implicit trace, pop it.
+3. Register your interceptor BEFORE `ContextAwareSpanProcessor` in the
+   `TracerProvider` so it runs first (the processor ordering matters
+   for `on_start`).
+4. Add a settings dataclass mirroring `DeepEvalInstrumentationSettings`
+   if your framework needs trace-level defaults (most do).
+5. Schema-asserted tests + at least one runnable validation script
+   (mirror the `pydantic_after_*` pattern at the repo root).
+
+### Lessons learned (don't repeat these)
+
+- **Don't monkey-patch global stdlib.** Any module-level side effect
+  on `import` (e.g. replacing `shutil.rmtree`) leaks into every other
+  caller in the process. Call your wrapper explicitly at the
+  call-sites that need it.
+- **OTel attrs are primitives only.** If you're tempted to `json.dumps`
+  a Python instance to fit it in an attr — stop and use the metrics
+  overlay pattern instead. JSONing strips type info you'll need on
+  the rebuild side.
+- **Late-arriving parents are a real concern.** Children whose
+  `on_end` fires before the parent's land as roots in
+  `trace.root_spans`. `add_span_to_trace` re-parents orphans when the
+  parent later arrives, but make sure your DFS walker also iterates
+  ALL roots — not just `root_spans[0]` — as defense in depth.
+- **The eval pipeline must walk spans even when traces error.** The
+  outer `_skip_metrics_for_error` guard used to skip span hydration on
+  errored traces, hiding the actual error info from the dashboard.
+  The walker handles per-span skip internally; don't pre-empt it at
+  the outer layer.
+- **`trace_manager.is_evaluating` is a `@property`, not a method.** Yes
+  this bit me this session. Call as `trace_manager.is_evaluating`,
+  not `trace_manager.is_evaluating()`.
